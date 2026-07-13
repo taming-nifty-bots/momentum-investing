@@ -1,0 +1,89 @@
+name: Build and Deploy ETF Momentum Rotation
+
+# Mirrors the other strategies' CI/CD: build one image per job folder, push to
+# ACR, update the two scheduled Azure Container App Jobs, and restart any that
+# are running so they pick up the new image.
+#   * signal   -> after the NSE close   (e.g. 18:00 IST, Mon-Fri)
+#   * momentum -> just after the open   (e.g. 09:20 IST, Mon-Fri)
+#
+# The universe/params live in Mongo and are seeded manually (one-time) - that is
+# intentionally NOT part of this pipeline.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  SIGNAL_IMAGE_NAME: etf-momentum-signal:${{ github.run_number }}
+  MOMENTUM_IMAGE_NAME: etf-momentum:${{ github.run_number }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: true
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ secrets.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build Docker images
+        run: |
+          docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }} ./signal
+          docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }} ./momentum
+
+      - name: Push Docker images
+        run: |
+          docker push ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }}
+          docker push ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }}
+
+      - name: Deploy SIGNAL job
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az containerapp job update \
+              --name ${{ secrets.ETF_SIGNAL_JOB_NAME }} \
+              --resource-group ${{ secrets.RESOURCE_GROUP }} \
+              --image ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }}
+
+      - name: Deploy MOMENTUM job
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az containerapp job update \
+              --name ${{ secrets.ETF_MOMENTUM_JOB_NAME }} \
+              --resource-group ${{ secrets.RESOURCE_GROUP }} \
+              --image ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }}
+
+      - name: Restart running SIGNAL jobs
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            running_jobs=$(az containerapp job execution list --name ${{ secrets.ETF_SIGNAL_JOB_NAME }} --resource-group ${{ secrets.RESOURCE_GROUP }} --query "[?properties.status=='Running']")
+            if [ "$running_jobs" != "[]" ]; then
+              az containerapp job stop -n ${{ secrets.ETF_SIGNAL_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
+              az containerapp job start -n ${{ secrets.ETF_SIGNAL_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
+            fi
+
+      - name: Restart running MOMENTUM jobs
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            running_jobs=$(az containerapp job execution list --name ${{ secrets.ETF_MOMENTUM_JOB_NAME }} --resource-group ${{ secrets.RESOURCE_GROUP }} --query "[?properties.status=='Running']")
+            if [ "$running_jobs" != "[]" ]; then
+              az containerapp job stop -n ${{ secrets.ETF_MOMENTUM_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
+              az containerapp job start -n ${{ secrets.ETF_MOMENTUM_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
+            fi
