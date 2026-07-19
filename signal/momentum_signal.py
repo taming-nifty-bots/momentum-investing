@@ -52,7 +52,7 @@ def today():
 
 
 def is_trading_day():
-    return today().weekday() < 5
+    return today().weekday() < 8      # TEST override (runs any day); use < 5 (Mon-Fri) for live
 
 
 def parse_date(s):
@@ -102,10 +102,14 @@ def stop_hit(current_close, peak, stop_pct):
 def select_rebalance(held, ranked, rank_of, buckets, n_hold, top_retain):
     """
     Monthly rebalance selection (bt_v2 lines 284-300):
-      retained    = held names still ranked <= top_retain, one per bucket
+      retained    = held names still ranked <= top_retain, one per bucket (kept)
       new_entries = best-ranked eligible names filling the remaining slots,
-                    one per bucket, skipping buckets already used
-      rotate_out  = held names not retained (sold at the open)
+                    one per bucket, skipping buckets already used (bought)
+
+    Anything held that is NOT retained is a rotation exit. We don't return a
+    separate rotate_out list any more - the momentum job derives it as
+    "held and not retained", flags those positions marked_for_exit, and sells
+    them in its single exit loop (same flag the trailing stop uses).
     """
     retained, used = [], set()
     for sym in held:
@@ -128,8 +132,7 @@ def select_rebalance(held, ranked, rank_of, buckets, n_hold, top_retain):
         used.add(b)
         slots -= 1
 
-    rotate_out = [s for s in held if s not in retained]
-    return retained, new_entries, rotate_out
+    return retained, new_entries
 
 
 # --- market data (Definedge daily candles via tamingnifty) --------------------
@@ -233,7 +236,7 @@ def main():
     # plan is computed on the holdings that survive tonight's stops (they sell at
     # the open before the rebalance is evaluated - matches the engine's ordering)
     held_after_stops = [p["symbol"] for p in active if p["symbol"] not in stopped_now]
-    retained, new_entries, rotate_out = select_rebalance(
+    retained, new_entries = select_rebalance(
         held_after_stops, ranked, rank_of, bucket_of, n_hold, top_retain)
 
     plan = {
@@ -246,7 +249,6 @@ def main():
         "stop_exits": stopped_now,
         "retained": retained,
         "new_entries": new_entries,
-        "rotate_out": rotate_out,
         "n_hold": n_hold,
         "top_retain": top_retain,
         "lookback": lookback,
@@ -255,9 +257,9 @@ def main():
     positions.update_one({"_id": "meta"}, {"$set": {"last_signal_date": str(today())}}, upsert=True)
 
     notify("SIGNAL done. signal_date={sd} | held={hb} | stops={st} | "
-           "retain={rt} | new={nw} | rotate_out={ro}".format(
+           "retain={rt} | new={nw}".format(
                sd=plan["signal_date"], hb=plan["held_before"], st=stopped_now,
-               rt=retained, nw=new_entries, ro=rotate_out))
+               rt=retained, nw=new_entries))
     if ranked:
         notify("SIGNAL ranking (top): " + ", ".join(
             f"{s}#{rank_of[s]}({mom_of[s]*100:.1f}%)" for s in ranked[:6]))
