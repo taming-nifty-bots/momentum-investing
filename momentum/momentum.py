@@ -81,7 +81,7 @@ def today():
 
 
 def is_trading_day():
-    return today().weekday() < 8      # TEST override (runs any day); use < 5 (Mon-Fri) for live
+    return today().weekday() < 5      # Mon-Fri only (live)
 
 
 def parse_date(s):
