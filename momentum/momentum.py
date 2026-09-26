@@ -1,34 +1,32 @@
 """
 ETF Momentum Rotation - MOMENTUM job (runs once a day, at/just after the open).
 
-The only job that places orders. It does, in this order:
+The only job that places orders. Four steps, in this order:
 
   1. Rebalance marking (first session of a new month only): read the plan the
      signal job stored last evening and flag every holding it did NOT retain
      (a rotation - it fell out of the ranking) with marked_for_exit. This is the
      SAME flag the signal job already sets on a trailing-stop breach, so both
      kinds of exit share one mechanism - there is no separate rotate_out list.
-  2. Exit loop (every day): market-sell every holding flagged marked_for_exit -
-     the trailing stops flagged by the signal job last night PLUS the rotations
-     flagged in step 1. Frees cash (unsettled until tomorrow under T+1).
-  3. Deferred entries (any day): if a PREVIOUS rebalance session left a pending
-     buy, deploy that snapshot's cash equally across the new entries at today's
-     prices, floored to whole units (skip a name if its slice buys 0 units).
-  4. New entries (rebalance day only): buy the plan's new entries to refill the
-     book toward n_hold. If nothing was sold today the cash is already settled,
-     so buy now; if anything was sold today the freed cash won't settle until
-     tomorrow, so record the new entries + a freed-cash snapshot as a pending
-     buy, to be deployed the NEXT session (see T+1 below).
+  2. Exit loop (every day): market-sell every holding flagged marked_for_exit.
+  3. If anything sold, STOP. Nothing else can happen today.
+  4. Otherwise, if a rebalance is due, buy the plan's new entries with the cash
+     we have, and only then stamp the month as rebalanced.
 
-T+1 settlement: the broker (Dhan) settles equity delivery on a strict T+1
-cycle, so the cash freed by a same-day SELL is NOT usable to buy the same day.
-The rebalance therefore only defers its new-entry buys when it actually sold
-something that day (a stop or a rotation); those deferred buys fill the NEXT
-session, matching the entry_lag=1 backtest. When the rebalance sells nothing
-(e.g. the very first run, or a month that just redeploys idle settled cash) the
-new entries are bought the SAME day. If a deferred next-session buy is rejected
-because the funds have still not settled, the job alerts on Slack and skips (the
-pending buy is dropped, not retried across further days).
+T+1 settlement is the whole reason for step 3. Dhan settles equity delivery on a
+strict T+1 cycle, so cash freed by a same-day SELL cannot buy anything until the
+next session. Rather than remember what to buy tomorrow, we just stop - and come
+back. What brings us back is that last_rebalanced_month is stamped in step 4 and
+nowhere else: until the buys are placed the rebalance is still "due", the signal
+job keeps the plan refreshed, and the next session picks up where we left off.
+By then every rotation has already been sold, so step 1 finds nothing to mark,
+step 2 sells nothing, and step 4 runs. The same mechanism retries a rejected
+sell (it stays flagged) and a rejected buy (the month stays unstamped), so no
+failure needs its own recovery path.
+
+When a rebalance sells nothing at all - the very first run, or a month whose
+holdings were all retained - steps 2 and 3 are no-ops and the buys happen the
+same day. That falls out of the ordering; it is not a special case.
 
 Cash gate (bt_v2 L369): new entries are funded only when freed cash (rotation
 proceeds + idle cash) > ~0. A runaway winner that leaves ~0 cash means zero new
@@ -116,8 +114,8 @@ def load_universe():
 
 # --- ledger -------------------------------------------------------------------
 # Two collections, one shape each: etf_positions_<user> holds nothing but
-# position documents, and the accounts / meta / plan / pending_buys singletons
-# live in etf_state_<user>. They used to share a collection, which worked only
+# position documents, and the accounts / meta / plan singletons live in
+# etf_state_<user>. They used to share a collection, which worked only
 # because the singletons happened to have no "status" field and so fell out of
 # find({"status": "active"}). That is a trap now that the ledger is DERIVED from
 # exactly those queries - one stray status field would silently skew the P&L.
@@ -183,23 +181,6 @@ def set_meta(**fields):
 
 def get_plan():
     return strip(state.find_one({"_id": "plan"}))
-
-
-def get_pending_buys():
-    return strip(state.find_one({"_id": "pending_buys"}))
-
-
-def set_pending_buys(month, new_entries, available):
-    state.update_one(
-        {"_id": "pending_buys"},
-        {"$set": {"month": month, "new_entries": list(new_entries),
-                  "available": round(float(available), 2),
-                  "created_date": str(today())}},
-        upsert=True)
-
-
-def clear_pending_buys():
-    state.delete_one({"_id": "pending_buys"})
 
 
 def active_positions():
@@ -331,7 +312,7 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
     return True
 
 
-def place_new_entries(conn, secid_of, tsym_of, bucket_of, new_entries, available, label):
+def place_new_entries(conn, secid_of, tsym_of, bucket_of, new_entries, available):
     """Buy `new_entries` now, splitting `available` cash equally across them, each
     slice floored to whole units (matches the engine's equal-weight day snapshot).
 
@@ -349,44 +330,11 @@ def place_new_entries(conn, secid_of, tsym_of, bucket_of, new_entries, available
         tsym = tsym_of.get(sym, sym)
         result = buy(conn, sym, secid, tsym, bucket_of.get(sym, ""), alloc_each)
         if result is False:                             # broker rejected the order
-            notify(f"MOMENTUM: buy REJECTED for {label} - broker declined "
-                   f"(e.g. funds unsettled). Skipping the remaining new entries.")
+            notify(f"MOMENTUM: buy REJECTED - broker declined (e.g. funds unsettled). "
+                   f"Skipping the remaining new entries; the month stays unstamped so "
+                   f"the next session tries again.")
             return False
     return True
-
-
-def deploy_pending_buys(conn, secid_of, tsym_of, bucket_of):
-    """Deploy the new entries deferred from the previous rebalance session.
-
-    T+1 settlement means the cash freed by the rebalance-day sells is only usable
-    the NEXT session. This runs every day; when it finds a pending-buys snapshot
-    recorded on an earlier session it deploys that snapshot's cash equally across
-    the new entries at today's prices (matching the entry_lag=1 backtest). If the
-    broker rejects a buy because the funds have still not settled, it alerts on
-    Slack and skips the rest - the pending buys are then dropped, never carried
-    across further days.
-    """
-    pending = get_pending_buys()
-    if not pending:
-        return
-    if str(pending.get("created_date", "")) >= str(today()):
-        return                                          # recorded today; funds not settled yet
-
-    new_entries = list(pending.get("new_entries") or [])
-    available = float(pending.get("available") or 0.0)
-    month = pending.get("month", "")
-    if not new_entries or available <= 1e-9:
-        clear_pending_buys()
-        return
-
-    notify(f"MOMENTUM: deploying deferred entries for {month} (T+1 settled) | "
-           f"new={new_entries} | cash_snapshot=Rs{available:.0f}")
-    ok = place_new_entries(conn, secid_of, tsym_of, bucket_of,
-                           new_entries, available, f"{month} deferred (T+1)")
-    if not ok:
-        notify(f"MOMENTUM: day-2 funds still unsettled for {month} - dropping the pending "
-               f"buys (not retried across further days).")
-    clear_pending_buys()
 
 
 def summary():
@@ -415,14 +363,17 @@ def main():
     # orders start getting refused.
     notify(f"MOMENTUM public IP: {util.get_public_ip()}")
 
-    # 1. On the first session of a new month, decide the rebalance and flag its
-    #    rotations. A rotation is any holding the signal job did NOT retain (it
-    #    fell out of the ranking). We mark those positions marked_for_exit here so
-    #    the SINGLE exit loop below sells them alongside the trailing-stop exits -
-    #    one exit mechanism, no separate rotate_out list.
+    # 1. Rebalance marking. On the first session of a new month, flag every
+    #    holding the signal job did NOT retain - it fell out of the ranking, so it
+    #    is a rotation. Same marked_for_exit flag the trailing stop uses, so the
+    #    exit loop below sells both kinds without knowing the difference.
+    #
+    #    On the SECOND day of a rebalance there is nothing left to mark: everything
+    #    not retained was sold yesterday. The loop finds no rotations, sells
+    #    nothing, and falls through to the buys. That is how the two halves of one
+    #    rebalance line up across two sessions without any extra bookkeeping.
     current_month = month_key()
-    meta = get_meta()
-    rebalancing = current_month != meta.get("last_rebalanced_month")
+    rebalancing = current_month != get_meta().get("last_rebalanced_month")
     plan = get_plan() if rebalancing else None
     if rebalancing and not plan:
         notify(f"MOMENTUM: rebalance DUE for {current_month} but no plan found. "
@@ -445,45 +396,48 @@ def main():
         notify(f"MOMENTUM: rebalancing {current_month} | retain={sorted(retained)} | "
                f"rotate={[p['symbol'] for p in rotations]} | new={plan['new_entries']}")
 
-    # 2. Single exit loop (every day): market-sell every position flagged
-    #    marked_for_exit - the trailing stops flagged by the signal job last night
-    #    plus the rotations flagged in step 1. Frees cash (unsettled until tomorrow
-    #    under T+1). sold_today gates the new-entry buys below.
-    sold_today = False
+    # 2. Exit loop, every day: market-sell everything flagged marked_for_exit -
+    #    last night's trailing stops plus the rotations just marked. One loop, one
+    #    flag, no separate rotate-out list.
+    sold_today = []
     for pos in active_positions():
         if pos.get("marked_for_exit"):
             time.sleep(1)
             sell(conn, secid_of, pos, pos.get("exit_reason") or "trailing_stop")
-            sold_today = True
+            sold_today.append(pos["symbol"])
 
-    # 3. Deploy any new entries deferred from a PREVIOUS rebalance session (their
-    #    freed cash has now settled under T+1).
-    deploy_pending_buys(conn, secid_of, tsym_of, bucket_of)
+    # 3. If we sold anything, stop here. Dhan settles equity delivery T+1, so the
+    #    cash those sells just freed is NOT usable until the next session - there
+    #    is nothing we could buy with it today. Leaving last_rebalanced_month
+    #    unstamped is what brings us back tomorrow: the rebalance is still "due",
+    #    the signal job keeps the plan refreshed until it is consumed, and
+    #    tomorrow's run finds no rotations left to mark and goes straight to the
+    #    buys. A rejected sell stays flagged and is simply retried the same way.
+    if sold_today:
+        notify(f"MOMENTUM: sold {sold_today} today - T+1 means that cash is not usable "
+               f"until the next session, so no entries today.")
+        summary()
+        return
 
-    # 4. Place this rebalance's new entries. Under T+1 the cash freed by today's
-    #    sells does not settle until tomorrow, so:
-    #      - sold something today -> DEFER: record a pending-buys snapshot; the next
-    #        session's step 3 deploys it once the cash settles.
-    #      - sold nothing today   -> the cash is already settled (the very first run,
-    #        or a month that only redeploys idle cash), so BUY the new entries now.
+    # 4. Nothing sold, so whatever cash we hold is settled. If a rebalance is due,
+    #    buy the plan's new entries - the names needed to bring the book back to
+    #    n_hold - splitting the available cash equally between them. Stamping the
+    #    month is the LAST thing we do, so the rebalance counts as done only once
+    #    the buys are actually placed.
     if rebalancing:
-        new_entries = list(plan["new_entries"])
+        new_entries = [s for s in plan["new_entries"]
+                       if s not in {p["symbol"] for p in active_positions()}]
         available = compute_accounts()["unused_balance"]
         if not new_entries or available <= 1e-9:
             notify(f"MOMENTUM: no new entries to place (new={new_entries}, cash=Rs{available:.0f}).")
-        elif sold_today:
-            set_pending_buys(current_month, new_entries, available)
-            notify(f"MOMENTUM: sold today -> deferring {len(new_entries)} new entries to the next "
-                   f"session (T+1) | new={new_entries} | cash_snapshot=Rs{available:.0f}")
+            set_meta(last_rebalanced_month=current_month)
         else:
-            notify(f"MOMENTUM: no exits today -> buying {len(new_entries)} new entries now "
-                   f"(settled cash) | new={new_entries} | cash=Rs{available:.0f}")
-            place_new_entries(conn, secid_of, tsym_of, bucket_of,
-                              new_entries, available, f"{current_month} same-day")
-        set_meta(last_rebalanced_month=current_month, last_momentum_date=str(today()))
-    else:
-        set_meta(last_momentum_date=str(today()))
+            notify(f"MOMENTUM: buying {len(new_entries)} new entries (settled cash) | "
+                   f"new={new_entries} | cash=Rs{available:.0f}")
+            if place_new_entries(conn, secid_of, tsym_of, bucket_of, new_entries, available):
+                set_meta(last_rebalanced_month=current_month)
 
+    set_meta(last_momentum_date=str(today()))
     summary()
 
 
