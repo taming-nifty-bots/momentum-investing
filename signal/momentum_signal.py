@@ -10,9 +10,9 @@ Analysis only - it never places an order. It does two things:
      monthly-rebalance plan (stamped with the signal date). The momentum job
      uses the plan on the first session of a new month.
 
-Universe + parameters are read from MongoDB (etf_universe, etf_params).
-Like the other strategies: one self-contained file, tamingnifty for the broker
-and Slack, MongoDB as the ledger.
+The universe is read from MongoDB (etf_universe); the strategy parameters are
+constants below. Like the other strategies: one self-contained file, tamingnifty
+for the broker and Slack, MongoDB as the ledger.
 
 SCHEDULING: everything here is driven by DAILY candles, so this job must not act
 on a session until that session's daily bar has been published. It runs the
@@ -44,9 +44,22 @@ slack_client = WebClient(token=os.environ.get("slack_token"))
 mongo_client = MongoClient(CONNECTION_STRING)
 db = mongo_client[MONGO_DB]
 universe_coll = db["etf_universe"]
-params_coll = db["etf_params"]
 positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing else
 state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
+
+# --- strategy parameters ------------------------------------------------------
+# A 1:1 transcription of the validated engine (bt_v2.py, FINALCFG). These used to
+# sit in an etf_params document in Mongo, which meant the strategy could be
+# changed without a code change and without leaving a trace. They are constants
+# here instead, so git history IS the audit trail: changing one is a commit, a
+# review and a redeploy, which is the correct amount of friction for numbers that
+# define the strategy. The 28-ETF universe stays in Mongo - that is data, not a
+# rule, and it is edited far more often.
+LOOKBACK = 21          # momentum window, in trading days
+N_HOLD = 4             # target number of holdings
+TOP_RETAIN = 7         # keep a holding while its rank is <= this
+STOP_PCT = 0.08        # trailing stop, below the peak daily close
+MOMENTUM_MIN = 0.0     # eligibility: momentum must be STRICTLY above this
 
 
 def notify(message):
@@ -199,15 +212,7 @@ def newest_candle_date(series_of):
     return newest
 
 
-# --- universe + params (read from Mongo; fail loudly if unseeded) -------------
-def load_params():
-    doc = params_coll.find_one({"_id": "params"})
-    if not doc:
-        notify("SIGNAL ABORT: etf_params is empty - seed etf_params in Mongo first.")
-        raise SystemExit(1)
-    return doc
-
-
+# --- universe (read from Mongo; fail loudly if unseeded) ----------------------
 def get_meta():
     doc = state.find_one({"_id": "meta"})
     return doc or {}
@@ -232,16 +237,10 @@ def main():
         notify("SIGNAL: not a trading day - nothing to do.")
         return
 
-    params = load_params()
-    lookback = int(params["lookback"])
-    n_hold = int(params["n_hold"])
-    top_retain = int(params["top_retain"])
-    stop_pct = float(params["stop_pct"])
-    momentum_min = float(params.get("momentum_min", 0.0))
     candidates, secid_of, tsym_of, bucket_of = load_universe()
 
     conn = edge.login_to_dhan()
-    notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={lookback}, stop={stop_pct*100:.0f}%)")
+    notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={LOOKBACK}, stop={STOP_PCT*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
     # 1. Pull every daily series this run needs, once.
@@ -289,7 +288,7 @@ def main():
             "ltp": round(last, 4),
             "shadow_pnl": round((last - float(pos["entry_price"])) * pos["quantity"], 2),
         }
-        if stop_hit(last, peak, stop_pct) and not pos.get("marked_for_exit"):
+        if stop_hit(last, peak, STOP_PCT) and not pos.get("marked_for_exit"):
             fields["marked_for_exit"] = True
             fields["exit_reason"] = "trailing_stop"
             stopped_now.append(sym)
@@ -304,13 +303,13 @@ def main():
         if closes:
             closes_by_symbol[sym] = closes
 
-    ranked, rank_of, mom_of = rank_universe(closes_by_symbol, lookback, momentum_min)
+    ranked, rank_of, mom_of = rank_universe(closes_by_symbol, LOOKBACK, MOMENTUM_MIN)
 
     # plan is computed on the holdings that survive tonight's stops (they sell at
     # the open before the rebalance is evaluated - matches the engine's ordering)
     held_after_stops = [p["symbol"] for p in active if p["symbol"] not in stopped_now]
     retained, new_entries = select_rebalance(
-        held_after_stops, ranked, rank_of, bucket_of, n_hold, top_retain)
+        held_after_stops, ranked, rank_of, bucket_of, N_HOLD, TOP_RETAIN)
 
     plan = {
         "signal_date": str(signal_date),
@@ -322,9 +321,9 @@ def main():
         "stop_exits": stopped_now,
         "retained": retained,
         "new_entries": new_entries,
-        "n_hold": n_hold,
-        "top_retain": top_retain,
-        "lookback": lookback,
+        "n_hold": N_HOLD,
+        "top_retain": TOP_RETAIN,
+        "lookback": LOOKBACK,
     }
     state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
     # last_candle_date is what the freshness guard above reads next run: the

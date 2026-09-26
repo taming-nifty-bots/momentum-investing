@@ -13,7 +13,13 @@ self-contained, scheduled container jobs.
 ## The strategy (exact rules)
 
 Every number below is a 1:1 transcription of the validated engine (`bt_v2.py`,
-`FINALCFG`) and lives in the `etf_params` document in Mongo.
+`FINALCFG`) and lives as a **constant at the top of the job file** -
+`LOOKBACK / N_HOLD / TOP_RETAIN / STOP_PCT / MOMENTUM_MIN` in
+`signal/momentum_signal.py`, `START_CAPITAL` in `momentum/momentum.py`. They used
+to sit in an `etf_params` document in Mongo, which meant the strategy could be
+changed without a code change and without leaving a trace; as constants, git
+history is the audit trail and changing one costs a commit and a redeploy. The
+universe stays in Mongo - that is data, not a rule.
 
 | Rule | Value |
 |------|-------|
@@ -104,7 +110,9 @@ Shared, read by both jobs (seeded once; already populated in prod):
 | Collection | `_id` | Contents |
 |------------|-------|----------|
 | `etf_universe` | symbol | `{symbol, tsym, secid, bucket, name, is_park}` - 27 ETFs + `LIQUIDCASE` |
-| `etf_params` | `params` | `lookback, n_hold, top_retain, stop_pct, momentum_min, start_capital` |
+
+This is now the **only** shared collection. The strategy parameters are constants
+in the job files (see *The strategy* above), so there is nothing else to seed.
 
 Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 
@@ -142,8 +150,8 @@ momentum-investing/
 
 All job dependencies are installed **from `requirements.txt` inside the
 Dockerfile** - no ad-hoc `pip install`, matching the other strategies. The
-universe + parameters live in Mongo (no `config.py` in the repo); seed or edit
-them directly in the `Bots` DB.
+strategy parameters are constants at the top of each job file (no `config.py` in
+the repo); the ETF universe lives in Mongo - edit it directly in the `Bots` DB.
 
 ## Running
 
