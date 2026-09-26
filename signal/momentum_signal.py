@@ -168,9 +168,34 @@ def daily_closes(conn, secid, lookback_days=400):
     return dates, closes
 
 
-def closes_since(conn, secid, start_date):
-    dates, closes = daily_closes(conn, secid)
-    return [c for d, c in zip(dates, closes) if d >= start_date]
+def fetch_all(conn, candidates, secid_of, active):
+    """Pull every daily series this run needs, ONCE.
+
+    Both the trailing-stop pass and the ranking read from the dict this returns,
+    so no symbol is ever requested from Dhan twice in a run. Holdings that have
+    since dropped out of etf_universe are fetched too - a position still needs
+    its stop maintained even if it is no longer a ranking candidate.
+    """
+    series_of = {}
+    for sym in candidates:
+        series_of[sym] = daily_closes(conn, secid_of[sym])
+    for pos in active:
+        sym = pos["symbol"]
+        if sym in series_of:
+            continue
+        secid = pos.get("secid") or secid_of.get(sym)
+        if secid:
+            series_of[sym] = daily_closes(conn, secid)
+    return series_of
+
+
+def newest_candle_date(series_of):
+    """The most recent daily-bar date Dhan returned, across the whole fetch."""
+    newest = None
+    for dates, closes in series_of.values():
+        if dates:
+            newest = dates[-1] if newest is None else max(newest, dates[-1])
+    return newest
 
 
 # --- universe + params (read from Mongo; fail loudly if unseeded) -------------
@@ -180,6 +205,11 @@ def load_params():
         notify("SIGNAL ABORT: etf_params is empty - seed etf_params in Mongo first.")
         raise SystemExit(1)
     return doc
+
+
+def get_meta():
+    doc = positions.find_one({"_id": "meta"})
+    return doc or {}
 
 
 def load_universe():
@@ -213,19 +243,42 @@ def main():
     notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={lookback}, stop={stop_pct*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
-    # 1. trailing-stop maintenance on active holdings
+    # 1. Pull every daily series this run needs, once.
     active = list(positions.find({"status": "active"}))
+    series_of = fetch_all(conn, candidates, secid_of, active)
+    signal_date = newest_candle_date(series_of)
+
+    # 2. Freshness guard. Everything below decides ONE thing: what to do about
+    #    the session whose daily bar is the newest one Dhan has. If that is the
+    #    same bar the previous run already acted on, there is nothing new to
+    #    decide - so stop, rather than rewrite an identical plan or (the real
+    #    hazard) silently re-decide on a stale bar because the latest one has
+    #    not been published yet. This makes the cron slot a performance question
+    #    instead of a correctness one, and makes the job safe to re-run by hand.
+    #    The candle date and the wall-clock time are logged on every run, so the
+    #    Slack history measures Dhan's real publish lag for free.
+    if signal_date is None:
+        notify("SIGNAL ABORT: Dhan returned no daily candles at all - not writing a plan.")
+        raise SystemExit(1)
+    last_done = get_meta().get("last_candle_date")
+    notify(f"SIGNAL: newest daily candle = {signal_date}, seen at "
+           f"{datetime.now():%H:%M:%S} | last processed = {last_done or 'never'}")
+    if str(signal_date) == str(last_done):
+        notify("SIGNAL: no new candle since the last run - nothing to do.")
+        return
+
+    # 3. trailing-stop maintenance on active holdings
     stopped_now = []
     for pos in active:
         sym = pos["symbol"]
-        secid = pos.get("secid") or secid_of.get(sym)
-        if not secid:
-            notify(f"SIGNAL: no secid for {sym}; skipping peak update")
+        dates, all_closes = series_of.get(sym, ([], []))
+        if not all_closes:
+            notify(f"SIGNAL: no candles for {sym}; skipping peak update")
             continue
         entry_dt = parse_date(pos["entry_date"])
-        closes = closes_since(conn, secid, entry_dt)
+        closes = [c for d, c in zip(dates, all_closes) if d >= entry_dt]
         if not closes:
-            notify(f"SIGNAL: no candles for {sym}; skipping peak update")
+            notify(f"SIGNAL: no candles since entry for {sym}; skipping peak update")
             continue
         peak = update_peak(float(pos["entry_price"]), closes)
         last = closes[-1]
@@ -243,15 +296,12 @@ def main():
                    f"({(last/peak-1)*100:.1f}% from peak) -> sell at next open")
         positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields})
 
-    # 2. tonight's ranking + provisional rebalance plan
+    # 4. tonight's ranking + provisional rebalance plan
     closes_by_symbol = {}
-    signal_date = None
     for sym in candidates:
-        dates, closes = daily_closes(conn, secid_of[sym])
+        dates, closes = series_of.get(sym, ([], []))
         if closes:
             closes_by_symbol[sym] = closes
-            if dates:
-                signal_date = dates[-1] if signal_date is None else max(signal_date, dates[-1])
 
     ranked, rank_of, mom_of = rank_universe(closes_by_symbol, lookback, momentum_min)
 
@@ -262,7 +312,7 @@ def main():
         held_after_stops, ranked, rank_of, bucket_of, n_hold, top_retain)
 
     plan = {
-        "signal_date": str(signal_date or today()),
+        "signal_date": str(signal_date),
         "generated_on": str(today()),
         "ranked_top": ranked[:10],
         "rank_of": {s: rank_of[s] for s in ranked[:12]},
@@ -276,7 +326,12 @@ def main():
         "lookback": lookback,
     }
     positions.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
-    positions.update_one({"_id": "meta"}, {"$set": {"last_signal_date": str(today())}}, upsert=True)
+    # last_candle_date is what the freshness guard above reads next run: the
+    # CANDLE this plan was decided on, not the day the job happened to run.
+    positions.update_one({"_id": "meta"}, {"$set": {
+        "last_candle_date": str(signal_date),
+        "last_signal_date": str(today()),
+    }}, upsert=True)
 
     notify("SIGNAL done. signal_date={sd} | held={hb} | stops={st} | "
            "retain={rt} | new={nw}".format(
