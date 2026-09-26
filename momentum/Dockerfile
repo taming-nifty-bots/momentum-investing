@@ -9,10 +9,11 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # Non-secret defaults (secrets - CONNECTION_STRING, DHAN_CLIENT_ID, DHAN_PIN,
 # DHAN_TOTP, slack_token - are injected at runtime by the Container App job,
 # never baked into the image).
-# LIVE stays 0 here; set LIVE=1 in the job env only after go-live sign-off.
+# live_trading stays false here; set live_trading=true in the job env only
+# after go-live sign-off.
 ENV MONGO_DB="Bots"
 ENV user_name="sugam"
-ENV LIVE="0"
+ENV live_trading="false"
 
 # Copy the job into the image
 COPY . /app/src/

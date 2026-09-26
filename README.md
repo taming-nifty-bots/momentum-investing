@@ -7,8 +7,8 @@ as the author's other live strategies: **Dhan via the
 self-contained, scheduled container jobs.
 
 > **Not yet cleared for real money.** This strategy has zero forward-test credit.
-> The 100-trade rule applies: it must forward-test in **DRY RUN** (`LIVE=0`) before
-> `LIVE=1` is ever set. See *Safety* below.
+> The 100-trade rule applies: it must forward-test in **DRY RUN** (`live_trading=false`)
+> before `live_trading=true` is ever set. See *Safety* below.
 
 ## The strategy (exact rules)
 
@@ -123,7 +123,7 @@ momentum-investing/
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)
 |-- momentum/
-|   |-- momentum.py          # morning order job (DRY-RUN unless LIVE=1)
+|   |-- momentum.py          # morning order job (DRY-RUN unless live_trading=true)
 |   |-- requirements.txt
 |   |-- Dockerfile
 |   `-- .env                 # secrets (gitignored)
@@ -142,7 +142,7 @@ them directly in the `Bots` DB.
 docker build -t etf-signal ./signal
 docker run --rm --env-file signal/.env etf-signal
 
-# MOMENTUM - at/just after the open (DRY RUN while LIVE=0)
+# MOMENTUM - at/just after the open (DRY RUN while live_trading=false)
 docker build -t etf-momentum ./momentum
 docker run --rm --env-file momentum/.env etf-momentum
 ```
@@ -154,9 +154,10 @@ the plan and the stop flags that `signal` writes.
 
 ## Safety
 
-- **`LIVE=0` (default) = DRY RUN.** `momentum` simulates fills at LTP, updates the
-  Mongo ledger, and sends nothing to the broker. Set `LIVE=1` only after explicit
-  go-live sign-off.
+- **`live_trading=false` (default) = DRY RUN.** `momentum` simulates fills at LTP,
+  updates the Mongo ledger, and sends nothing to the broker. Set
+  `live_trading=true` only after explicit go-live sign-off. Same flag name and
+  same true/false values as the other strategies.
 - **100-trade rule.** This strategy has not been forward-tested. Run it in dry run
   and collect >= 100 trades before considering real capital.
 - **Concentration.** See the runaway-winner caveat above - size total capital with
