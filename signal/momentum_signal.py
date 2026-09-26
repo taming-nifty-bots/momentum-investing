@@ -1,21 +1,35 @@
 """
-ETF Momentum Rotation - SIGNAL job (runs once a day, after the close).
+ETF Momentum Rotation - SIGNAL job (runs once a day, before the open).
 
-Analysis only - it never places an order. It does two things:
+EVERY decision the strategy makes is made here. This job never places an order;
+the momentum job places orders and decides nothing. The two never call each
+other - they meet only at two fields in Mongo:
 
-  1. Trailing stop: for every active holding, update the peak (highest daily
-     close since entry) and flag it for exit if the close has dropped stop_pct
-     below that peak. The momentum job sells the flagged names at the next open.
-  2. Ranking + plan, but ONLY when a rebalance is actually due: rank the 28 ETFs
-     by momentum and write the monthly-rebalance plan (stamped with the signal
-     date). Holdings rotate once a month, and the rank is only ever read at that
-     rebalance - the retain band and the new entries - so on the ~20 other
-     sessions in a month this whole step is skipped.
+    marked_for_exit   this job sets it, the momentum job sells whatever carries it
+    plan.target       this job writes it, the momentum job buys whatever is missing
 
-The two run on different clocks on purpose: a stop can break on ANY session, so
-step 1 is daily; a rotation happens once a month, so step 2 waits for the month
-boundary. Skipping step 2 changes no decision - it just stops computing a number
-nothing reads, and saves ~24 of the ~28 Dhan calls on an ordinary day.
+  1. Trailing stops - EVERY session. Update each holding's peak (highest daily
+     close since entry) and flag it marked_for_exit if the close has fallen
+     STOP_PCT below that peak. A stopped name is also removed from the target,
+     which is what stops the momentum job buying it straight back.
+  2. Ranking, rotations and the target - ONLY when a rebalance is due. Rank the
+     universe, work out what to keep and what to buy, flag the holdings that fell
+     out of the band with the SAME marked_for_exit flag, and write the target
+     book. Then stamp the month, so this step does not run again until the next
+     one.
+
+Rotations and stops share one flag on purpose. To the momentum job an exit is an
+exit; the reason is a label for the ledger, not something it acts on.
+
+The target is a desired STATE, not an instruction. The momentum job compares what
+is held against it and buys the difference, so re-reading it is harmless, a
+missed run costs nothing but time, and a half-finished one is picked up by the
+next session. That is also what makes T+1 work without any bookkeeping: the
+momentum job sells on day 1 and stops, and buys the still-missing names on day 2.
+
+The two steps run on different clocks because a stop can break on ANY session
+while a rotation happens once a month. Skipping step 2 changes no decision - the
+rank is read only at the rebalance - and saves ~24 of the ~28 Dhan calls a day.
 
 The universe is read from MongoDB (etf_universe); the strategy parameters are
 constants below. Like the other strategies: one self-contained file, tamingnifty
@@ -148,10 +162,9 @@ def select_rebalance(held, ranked, rank_of, buckets, n_hold, top_retain):
       new_entries = best-ranked eligible names filling the remaining slots,
                     one per bucket, skipping buckets already used (bought)
 
-    Anything held that is NOT retained is a rotation exit. We don't return a
-    separate rotate_out list any more - the momentum job derives it as
-    "held and not retained", flags those positions marked_for_exit, and sells
-    them in its single exit loop (same flag the trailing stop uses).
+    Anything held that is NOT retained is a rotation exit. There is no separate
+    rotate_out return value: the caller derives it as "held and not retained" and
+    flags those positions marked_for_exit, the same flag a trailing stop sets.
     """
     retained, used = [], set()
     for sym in held:
@@ -247,6 +260,22 @@ def set_meta(**fields):
     state.update_one({"_id": "meta"}, {"$set": fields}, upsert=True)
 
 
+def drop_from_target(sym):
+    """Take a stopped name out of the plan's target.
+
+    The momentum job buys whatever the target says is missing, so this one line
+    IS the no-mid-month-refill rule: remove the name and there is no longer a
+    gap for it to fill. Leave it in and the next session would buy it straight
+    back, which the strategy explicitly forbids - the freed cash has to sit idle
+    until the next rebalance.
+    """
+    plan = state.find_one({"_id": "plan"})
+    if not plan:
+        return
+    target = [s for s in (plan.get("target") or []) if s != sym]
+    state.update_one({"_id": "plan"}, {"$set": {"target": target}})
+
+
 def load_universe():
     docs = list(universe_coll.find({"is_park": {"$ne": True}}))
     if not docs:
@@ -329,6 +358,7 @@ def main():
             fields["marked_for_exit"] = True
             fields["exit_reason"] = "trailing_stop"
             stopped_now.append(sym)
+            drop_from_target(sym)                 # no refill: see drop_from_target
             notify(f"SIGNAL: STOP flagged {sym} close={last:.2f} peak={peak:.2f} "
                    f"({(last/peak-1)*100:.1f}% from peak) -> sell at next open")
         positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields})
@@ -374,36 +404,61 @@ def main():
 
     ranked, rank_of, mom_of = rank_universe(closes_by_symbol, LOOKBACK, MOMENTUM_MIN)
 
-    # plan is computed on the holdings that survive tonight's stops (they sell at
-    # the open before the rebalance is evaluated - matches the engine's ordering)
+    # The plan is computed on the holdings that survive tonight's stops (they sell
+    # at the open before the rebalance is evaluated - matches the engine's order).
     held_after_stops = [p["symbol"] for p in active if p["symbol"] not in stopped_now]
     retained, new_entries = select_rebalance(
         held_after_stops, ranked, rank_of, bucket_of, N_HOLD, TOP_RETAIN)
 
+    # Flag the rotations. Anything held that the ranking did not retain has fallen
+    # out of the band, so it goes out - marked with the SAME flag a trailing stop
+    # uses, because the momentum job is not supposed to know the difference. It
+    # sells what is flagged; deciding what deserves flagging is this job's work.
+    rotations = [p["symbol"] for p in active
+                 if p["symbol"] not in retained and p["symbol"] not in stopped_now
+                 and not p.get("marked_for_exit")]
+    for sym in rotations:
+        positions.update_one({"symbol": sym, "status": "active"},
+                             {"$set": {"marked_for_exit": True,
+                                       "exit_reason": "rebalance"}})
+
+    # target = the book we want to be holding once this rebalance has played out.
+    # The momentum job buys whatever of it is missing, so it is a desired STATE,
+    # not an instruction: re-reading it is harmless, and a run that is skipped or
+    # half-finished is simply picked up by the next one. Everything else in the
+    # plan is there to be read by a human in Mongo or Slack.
     plan = {
         "signal_date": str(signal_date),
         "generated_on": str(today()),
         "for_month": current_month,
+        "target": retained + new_entries,
+        "retained": retained,
+        "new_entries": new_entries,
+        "rotated_out": rotations,
+        "held_before": [p["symbol"] for p in active],
+        "stop_exits": stopped_now,
         "ranked_top": ranked[:10],
         "rank_of": {s: rank_of[s] for s in ranked[:12]},
         "mom_of": {s: round(mom_of[s], 4) for s in ranked[:12]},
-        "held_before": [p["symbol"] for p in active],
-        "stop_exits": stopped_now,
-        "retained": retained,
-        "new_entries": new_entries,
         "n_hold": N_HOLD,
         "top_retain": TOP_RETAIN,
         "lookback": LOOKBACK,
     }
     state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
-    # last_candle_date is what the freshness guard above reads next run: the
-    # CANDLE this plan was decided on, not the day the job happened to run.
-    set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()))
+
+    # Stamp the month HERE, not in the momentum job. This job decided the
+    # rebalance, so this job records that it is decided; tomorrow it goes back to
+    # stops-only and the target stays frozen for the momentum job to work through
+    # over however many sessions T+1 needs. last_candle_date is the CANDLE this
+    # was decided on, not the day the job happened to run.
+    set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()),
+             last_rebalanced_month=current_month)
 
     notify("SIGNAL done. signal_date={sd} | month={m} | held={hb} | stops={st} | "
-           "retain={rt} | new={nw}".format(
+           "retain={rt} | rotate={ro} | new={nw} | target={tg}".format(
                sd=plan["signal_date"], m=current_month, hb=plan["held_before"],
-               st=stopped_now, rt=retained, nw=new_entries))
+               st=stopped_now, rt=retained, ro=rotations, nw=new_entries,
+               tg=plan["target"]))
     if ranked:
         notify("SIGNAL ranking (top): " + ", ".join(
             f"{s}#{rank_of[s]}({mom_of[s]*100:.1f}%)" for s in ranked[:6]))
