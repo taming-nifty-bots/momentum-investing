@@ -110,8 +110,18 @@ Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 
 | Collection | Docs |
 |------------|------|
-| `etf_positions_<user>` | one doc per position, **plus** control docs `_id:accounts`, `_id:meta`, `_id:plan`, `_id:pending_buys` (the T+1 deferred new entries) |
+| `etf_positions_<user>` | one doc per position, and **nothing else** |
+| `etf_state_<user>` | the four control singletons - `_id:accounts` (the ledger), `_id:meta` (`last_candle_date`, `last_rebalanced_month`), `_id:plan` (tonight's rebalance plan), `_id:pending_buys` (the T+1 deferred new entries) |
 | `etf_orders_<user>` | one doc per placed/simulated order |
+
+The control docs used to share the positions collection, which worked only because
+they had no `status` field and so fell out of `find({"status": "active"})`. That is
+a trap now that the ledger is **derived** from exactly those queries - one stray
+`status` field on a singleton would silently skew the P&L - so they live apart.
+
+`_id:accounts` is a **cache**: `momentum` recomputes it from the position documents
+after every buy and sell (`compute_accounts`), so it self-heals and can never drift.
+Read it, don't write it.
 
 ## Layout
 

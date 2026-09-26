@@ -45,7 +45,8 @@ mongo_client = MongoClient(CONNECTION_STRING)
 db = mongo_client[MONGO_DB]
 universe_coll = db["etf_universe"]
 params_coll = db["etf_params"]
-positions = db[f"etf_positions_{user_name}"]
+positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing else
+state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
 
 
 def notify(message):
@@ -208,7 +209,7 @@ def load_params():
 
 
 def get_meta():
-    doc = positions.find_one({"_id": "meta"})
+    doc = state.find_one({"_id": "meta"})
     return doc or {}
 
 
@@ -325,10 +326,10 @@ def main():
         "top_retain": top_retain,
         "lookback": lookback,
     }
-    positions.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
+    state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
     # last_candle_date is what the freshness guard above reads next run: the
     # CANDLE this plan was decided on, not the day the job happened to run.
-    positions.update_one({"_id": "meta"}, {"$set": {
+    state.update_one({"_id": "meta"}, {"$set": {
         "last_candle_date": str(signal_date),
         "last_signal_date": str(today()),
     }}, upsert=True)
