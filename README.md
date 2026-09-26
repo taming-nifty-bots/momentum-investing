@@ -52,15 +52,38 @@ month boundary, rebalance**. Live, that is split into two scheduled jobs so
 decisions are made on completed candles and fills happen at the next open:
 
 - **`signal/`** - runs **early, before the open**, on the previous session's
-  completed daily candles. Analysis only, never places an order.
-  Updates each holding's trailing peak and flags stop breaches, ranks the 27
-  ETFs, and writes a provisional monthly-rebalance plan to Mongo.
-  *(It must not act on a session before that session's daily bar is published;
-  the morning slot is early enough to be safe. How soon after the close Dhan
-  actually publishes has not been measured — the only observation is that the
-  2026-09-25 bar was absent at 22:57 and present by 12:03 the next day, a
-  13-hour bracket that proves nothing narrower. Same completed candles either
-  way, so the decisions are unchanged.)*
+  completed daily candles. Analysis only, never places an order. It does two
+  things, on **two different clocks**:
+  - **every session** - update each holding's trailing peak and flag stop
+    breaches. A stop can break on any session, so this is unconditional. It
+    needs candles for the holdings only (at most 4).
+  - **only when a rebalance is due** (`month_key()` differs from the
+    `last_rebalanced_month` that `momentum` stamps) - rank the full universe and
+    write the monthly-rebalance plan to Mongo. The rank is read at exactly one
+    moment, that rebalance, for the retain band and the new entries; on the
+    other ~20 sessions of a month computing it would cost 28 rate-limited Dhan
+    calls to produce a number nothing consumes. Skipping it changes **no**
+    decision the strategy makes - the only visible difference is that the daily
+    Slack ranking post now appears on rebalance days only.
+
+  Because `last_rebalanced_month` is stamped by `momentum` when it *completes* a
+  rebalance, the condition stays true until the plan has actually been consumed:
+  if `momentum` misses the 1st, `signal` re-ranks and refreshes the plan every
+  session until it doesn't - which is also what keeps the plan inside
+  `momentum`'s `PLAN_MAX_AGE_DAYS` window.
+
+  *(It must not act on a session before that session's daily bar is published.
+  Rather than trust the cron slot for that, the job asks **one** liquid name -
+  `NIFTYBEES`, the `CALENDAR_REF` constant - for the newest daily bar and
+  compares it with the `last_candle_date` it stored last run; if they match
+  there is nothing new to decide and it stops, one Dhan call in. Which session
+  is "now" is a property of the market, not of what we happen to hold, so this
+  works with zero holdings and on a month with no rebalance due. It also makes
+  the job safe to re-run by hand, and logs the candle date next to the wall
+  clock every run - so the Slack history measures Dhan's real publish lag for
+  free. How soon after the close Dhan publishes has not been measured; the only
+  observation is that the 2026-09-25 bar was absent at 22:57 and present by
+  12:03 the next day, a 13-hour bracket that proves nothing narrower.)*
 - **`momentum/`** - runs **at/just after the open**. The only job that trades.
   Sells stop-flagged holdings, **deploys any new entries deferred from the
   previous rebalance** (T+1 settled cash), and on the first session of a new
@@ -136,7 +159,7 @@ Read it, don't write it.
 ```
 momentum-investing/
 |-- signal/
-|   |-- momentum_signal.py   # morning analysis job (ranking + stops + plan, no orders)
+|   |-- momentum_signal.py   # morning analysis job (stops daily, ranking + plan monthly, no orders)
 |   |-- requirements.txt     # all deps (incl. tamingnifty==2.1.0)
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)

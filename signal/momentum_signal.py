@@ -6,9 +6,16 @@ Analysis only - it never places an order. It does two things:
   1. Trailing stop: for every active holding, update the peak (highest daily
      close since entry) and flag it for exit if the close has dropped stop_pct
      below that peak. The momentum job sells the flagged names at the next open.
-  2. Ranking + plan: rank the 28 ETFs by momentum and write a provisional
-     monthly-rebalance plan (stamped with the signal date). The momentum job
-     uses the plan on the first session of a new month.
+  2. Ranking + plan, but ONLY when a rebalance is actually due: rank the 28 ETFs
+     by momentum and write the monthly-rebalance plan (stamped with the signal
+     date). Holdings rotate once a month, and the rank is only ever read at that
+     rebalance - the retain band and the new entries - so on the ~20 other
+     sessions in a month this whole step is skipped.
+
+The two run on different clocks on purpose: a stop can break on ANY session, so
+step 1 is daily; a rotation happens once a month, so step 2 waits for the month
+boundary. Skipping step 2 changes no decision - it just stops computing a number
+nothing reads, and saves ~24 of the ~28 Dhan calls on an ordinary day.
 
 The universe is read from MongoDB (etf_universe); the strategy parameters are
 constants below. Like the other strategies: one self-contained file, tamingnifty
@@ -61,6 +68,13 @@ TOP_RETAIN = 7         # keep a holding while its rank is <= this
 STOP_PCT = 0.08        # trailing stop, below the peak daily close
 MOMENTUM_MIN = 0.0     # eligibility: momentum must be STRICTLY above this
 
+# Which session is "now" is a property of the MARKET, not of what we happen to
+# hold, so the freshness guard asks one liquid name for the latest daily bar
+# rather than inferring it from the bulk fetch. NIFTYBEES is the most heavily
+# traded ETF on the NSE and will have a bar for every session; if it is ever
+# missing from etf_universe we fall back to the first candidate.
+CALENDAR_REF = "NIFTYBEES"
+
 
 def notify(message):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
@@ -80,6 +94,11 @@ def is_trading_day():
 
 def parse_date(s):
     return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+
+
+def month_key():
+    d = today()
+    return f"{d.year:04d}-{d.month:02d}"
 
 
 # --- strategy math (transcribed 1:1 from the validated engine bt_v2.py) -------
@@ -182,25 +201,31 @@ def daily_closes(conn, secid, lookback_days=400):
     return dates, closes
 
 
-def fetch_all(conn, candidates, secid_of, active):
-    """Pull every daily series this run needs, ONCE.
+def fetch_into(conn, series_of, wanted):
+    """Fetch the daily series for every (symbol, secid) in `wanted` we do not
+    already have, adding them to `series_of` in place.
 
-    Both the trailing-stop pass and the ranking read from the dict this returns,
-    so no symbol is ever requested from Dhan twice in a run. Holdings that have
-    since dropped out of etf_universe are fetched too - a position still needs
-    its stop maintained even if it is no longer a ranking candidate.
+    The run builds `series_of` up in stages - the calendar reference first, then
+    the holdings, then (only on a rebalance) the rest of the universe - and each
+    stage skips what an earlier one already fetched. So a name that is both held
+    and ranked still costs exactly one Dhan call, and an ordinary day never pays
+    for the 24-odd candidates nothing is going to read.
+
+    A symbol with no secid is skipped rather than fetched: a holding that has
+    dropped out of etf_universe carries its own secid on the position document,
+    which is what the caller passes in.
     """
-    series_of = {}
-    for sym in candidates:
-        series_of[sym] = daily_closes(conn, secid_of[sym])
-    for pos in active:
-        sym = pos["symbol"]
-        if sym in series_of:
+    for sym, secid in wanted:
+        if sym in series_of or not secid:
             continue
-        secid = pos.get("secid") or secid_of.get(sym)
-        if secid:
-            series_of[sym] = daily_closes(conn, secid)
+        series_of[sym] = daily_closes(conn, secid)
     return series_of
+
+
+def holdings_to_fetch(active, secid_of):
+    """(symbol, secid) for each active holding - its own secid first, so a name
+    that has since left etf_universe still gets its stop maintained."""
+    return [(p["symbol"], p.get("secid") or secid_of.get(p["symbol"])) for p in active]
 
 
 def newest_candle_date(series_of):
@@ -216,6 +241,10 @@ def newest_candle_date(series_of):
 def get_meta():
     doc = state.find_one({"_id": "meta"})
     return doc or {}
+
+
+def set_meta(**fields):
+    state.update_one({"_id": "meta"}, {"$set": fields}, upsert=True)
 
 
 def load_universe():
@@ -243,31 +272,39 @@ def main():
     notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={LOOKBACK}, stop={STOP_PCT*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
-    # 1. Pull every daily series this run needs, once.
-    active = list(positions.find({"status": "active"}))
-    series_of = fetch_all(conn, candidates, secid_of, active)
+    # 1. Freshness guard, on a SINGLE candle. Everything below decides one thing:
+    #    what to do about the session whose daily bar is the newest one Dhan has.
+    #    If that is the bar the previous run already acted on there is nothing new
+    #    to decide - so stop, rather than redo the stops or (the real hazard)
+    #    re-decide on a stale bar because the latest one is not published yet.
+    #    This makes the cron slot a performance question instead of a correctness
+    #    one, and makes the job safe to re-run by hand.
+    #
+    #    Asking ONE liquid name costs a single Dhan call, so the common "not
+    #    published yet" case - the very case this guard exists for - now exits in
+    #    about a second instead of walking the whole universe first. The candle
+    #    date and the wall clock are logged every run, so the Slack history
+    #    measures Dhan's real publish lag for free.
+    ref = CALENDAR_REF if CALENDAR_REF in secid_of else candidates[0]
+    series_of = {}
+    fetch_into(conn, series_of, [(ref, secid_of[ref])])
     signal_date = newest_candle_date(series_of)
-
-    # 2. Freshness guard. Everything below decides ONE thing: what to do about
-    #    the session whose daily bar is the newest one Dhan has. If that is the
-    #    same bar the previous run already acted on, there is nothing new to
-    #    decide - so stop, rather than rewrite an identical plan or (the real
-    #    hazard) silently re-decide on a stale bar because the latest one has
-    #    not been published yet. This makes the cron slot a performance question
-    #    instead of a correctness one, and makes the job safe to re-run by hand.
-    #    The candle date and the wall-clock time are logged on every run, so the
-    #    Slack history measures Dhan's real publish lag for free.
     if signal_date is None:
-        notify("SIGNAL ABORT: Dhan returned no daily candles at all - not writing a plan.")
+        notify(f"SIGNAL ABORT: Dhan returned no daily candles for the calendar "
+               f"reference {ref} - cannot tell which session this is, so not "
+               f"touching anything.")
         raise SystemExit(1)
     last_done = get_meta().get("last_candle_date")
-    notify(f"SIGNAL: newest daily candle = {signal_date}, seen at "
+    notify(f"SIGNAL: newest daily candle = {signal_date} (via {ref}), seen at "
            f"{datetime.now():%H:%M:%S} | last processed = {last_done or 'never'}")
     if str(signal_date) == str(last_done):
         notify("SIGNAL: no new candle since the last run - nothing to do.")
         return
 
-    # 3. trailing-stop maintenance on active holdings
+    # 2. Trailing-stop maintenance - EVERY day. A stop can break on any session,
+    #    so this runs unconditionally, and it only needs the holdings' candles.
+    active = list(positions.find({"status": "active"}))
+    fetch_into(conn, series_of, holdings_to_fetch(active, secid_of))
     stopped_now = []
     for pos in active:
         sym = pos["symbol"]
@@ -296,12 +333,44 @@ def main():
                    f"({(last/peak-1)*100:.1f}% from peak) -> sell at next open")
         positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields})
 
-    # 4. tonight's ranking + provisional rebalance plan
+    # 3. Ranking - ONLY when a rebalance is actually due. Holdings rotate once a
+    #    month, and the rank is read at exactly one moment: that rebalance, for
+    #    the retain band and the new entries. Ranking all 28 ETFs on the other ~20
+    #    sessions computes a number nothing consumes, at 28 rate-limited calls a
+    #    run. Skipping it changes no decision the strategy makes.
+    #
+    #    last_rebalanced_month is stamped by the MOMENTUM job when it finishes a
+    #    rebalance, so this condition stays true until the plan has actually been
+    #    consumed: if momentum does not run on the 1st, signal keeps refreshing
+    #    the plan every session until it does. That is also what keeps the plan
+    #    young enough for momentum's PLAN_MAX_AGE_DAYS check.
+    current_month = month_key()
+    if current_month == get_meta().get("last_rebalanced_month"):
+        set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()))
+        notify(f"SIGNAL done. signal_date={signal_date} | held={[p['symbol'] for p in active]} "
+               f"| stops={stopped_now} | {current_month} already rebalanced - ranking skipped "
+               f"({len(series_of)} of {len(candidates)} candles fetched).")
+        return
+
+    notify(f"SIGNAL: rebalance due for {current_month} - ranking the full universe.")
+    fetch_into(conn, series_of, [(s, secid_of[s]) for s in candidates])
+
     closes_by_symbol = {}
     for sym in candidates:
         dates, closes = series_of.get(sym, ([], []))
         if closes:
             closes_by_symbol[sym] = closes
+
+    # The rebalance is decided on this ranking, so a run that silently lost half
+    # the universe to rate limiting must not be allowed to write a plan from it.
+    if len(closes_by_symbol) < len(candidates):
+        missing = [s for s in candidates if s not in closes_by_symbol]
+        notify(f"SIGNAL: WARNING - no candles for {len(missing)} candidate(s): {missing}")
+    if len(closes_by_symbol) < len(candidates) * 0.8:
+        notify(f"SIGNAL ABORT: only {len(closes_by_symbol)} of {len(candidates)} candidates "
+               f"returned candles - refusing to write a rebalance plan from a partial "
+               f"universe. Re-run once Dhan is answering.")
+        raise SystemExit(1)
 
     ranked, rank_of, mom_of = rank_universe(closes_by_symbol, LOOKBACK, MOMENTUM_MIN)
 
@@ -314,6 +383,7 @@ def main():
     plan = {
         "signal_date": str(signal_date),
         "generated_on": str(today()),
+        "for_month": current_month,
         "ranked_top": ranked[:10],
         "rank_of": {s: rank_of[s] for s in ranked[:12]},
         "mom_of": {s: round(mom_of[s], 4) for s in ranked[:12]},
@@ -328,15 +398,12 @@ def main():
     state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
     # last_candle_date is what the freshness guard above reads next run: the
     # CANDLE this plan was decided on, not the day the job happened to run.
-    state.update_one({"_id": "meta"}, {"$set": {
-        "last_candle_date": str(signal_date),
-        "last_signal_date": str(today()),
-    }}, upsert=True)
+    set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()))
 
-    notify("SIGNAL done. signal_date={sd} | held={hb} | stops={st} | "
+    notify("SIGNAL done. signal_date={sd} | month={m} | held={hb} | stops={st} | "
            "retain={rt} | new={nw}".format(
-               sd=plan["signal_date"], hb=plan["held_before"], st=stopped_now,
-               rt=retained, nw=new_entries))
+               sd=plan["signal_date"], m=current_month, hb=plan["held_before"],
+               st=stopped_now, rt=retained, nw=new_entries))
     if ranked:
         notify("SIGNAL ranking (top): " + ", ".join(
             f"{s}#{rank_of[s]}({mom_of[s]*100:.1f}%)" for s in ranked[:6]))
