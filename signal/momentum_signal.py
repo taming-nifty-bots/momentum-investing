@@ -13,15 +13,21 @@ Analysis only - it never places an order. It does two things:
 Universe + parameters are read from MongoDB (etf_universe, etf_params).
 Like the other strategies: one self-contained file, tamingnifty for the broker
 and Slack, MongoDB as the ledger.
+
+SCHEDULING: everything here is driven by DAILY candles, and Dhan publishes a
+session's consolidated daily candle very late - on 2026-09-25 that day's bar
+still did not exist at 22:57. So this job has to run the MORNING AFTER the
+session it is acting on (before the momentum job), not the same evening.
 """
 import os
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 from pymongo import MongoClient
 from dotenv import find_dotenv, load_dotenv
 from slack_sdk import WebClient
-from tamingnifty import connect_definedge as edge
+from tamingnifty import connect_dhan as edge
 from tamingnifty import utils as util
 
 load_dotenv(find_dotenv())
@@ -135,12 +141,20 @@ def select_rebalance(held, ranked, rank_of, buckets, n_hold, top_retain):
     return retained, new_entries
 
 
-# --- market data (Definedge daily candles via tamingnifty) --------------------
-def daily_closes(conn, exchange, tsym, lookback_days=400):
+# --- market data (Dhan daily candles via tamingnifty) -------------------------
+# Dhan rate-limits the data API. Walking all 28 ETFs back to back with no pause
+# gets most of the calls refused with DH-904 (measured 2026-09-25: 17 of 27 failed
+# at no sleep, 0 failed at 0.25s), so every candle request waits first. At half a
+# second the whole universe still takes under 20 seconds.
+PAUSE_BETWEEN_CALLS = 0.5
+
+
+def daily_closes(conn, secid, lookback_days=400):
     """(dates, closes) ascending; ~400 calendar days covers the 21d + peak window."""
+    time.sleep(PAUSE_BETWEEN_CALLS)
     end = datetime.now()
     start = end - timedelta(days=lookback_days)
-    df = edge.fetch_historical_data(conn, exchange, tsym, start, end, "day")
+    df = edge.fetch_equity_data(conn, secid, start, end, "day")
     if df is None or len(df) == 0 or "close" not in df.columns:
         return [], []
     df = df.copy()
@@ -151,8 +165,8 @@ def daily_closes(conn, exchange, tsym, lookback_days=400):
     return dates, closes
 
 
-def closes_since(conn, exchange, tsym, start_date):
-    dates, closes = daily_closes(conn, exchange, tsym)
+def closes_since(conn, secid, start_date):
+    dates, closes = daily_closes(conn, secid)
     return [c for d, c in zip(dates, closes) if d >= start_date]
 
 
@@ -170,10 +184,13 @@ def load_universe():
     if not docs:
         notify("SIGNAL ABORT: etf_universe is empty - seed etf_universe in Mongo first.")
         raise SystemExit(1)
+    # secid is the NSE exchange token, which is also Dhan's securityId for cash
+    # equity - the same number that was already stored for Definedge.
+    secid_of = {d["symbol"]: d["secid"] for d in docs}
     tsym_of = {d["symbol"]: d["tsym"] for d in docs}
     bucket_of = {d["symbol"]: d["bucket"] for d in docs}
     candidates = [d["symbol"] for d in docs]
-    return candidates, tsym_of, bucket_of
+    return candidates, secid_of, tsym_of, bucket_of
 
 
 def main():
@@ -188,20 +205,23 @@ def main():
     top_retain = int(params["top_retain"])
     stop_pct = float(params["stop_pct"])
     momentum_min = float(params.get("momentum_min", 0.0))
-    series = params.get("series", "EQ")
-    candidates, tsym_of, bucket_of = load_universe()
+    candidates, secid_of, tsym_of, bucket_of = load_universe()
 
-    conn = edge.login_to_integrate()
+    conn = edge.login_to_dhan()
     notify(f"SIGNAL started ({exchange}, {len(candidates)} ETFs, lookback={lookback}, stop={stop_pct*100:.0f}%)")
+    notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
     # 1. trailing-stop maintenance on active holdings
     active = list(positions.find({"status": "active"}))
     stopped_now = []
     for pos in active:
         sym = pos["symbol"]
-        tsym = tsym_of.get(sym, f"{sym}-{series}")
+        secid = pos.get("secid") or secid_of.get(sym)
+        if not secid:
+            notify(f"SIGNAL: no secid for {sym}; skipping peak update")
+            continue
         entry_dt = parse_date(pos["entry_date"])
-        closes = closes_since(conn, exchange, tsym, entry_dt)
+        closes = closes_since(conn, secid, entry_dt)
         if not closes:
             notify(f"SIGNAL: no candles for {sym}; skipping peak update")
             continue
@@ -225,7 +245,7 @@ def main():
     closes_by_symbol = {}
     signal_date = None
     for sym in candidates:
-        dates, closes = daily_closes(conn, exchange, tsym_of[sym])
+        dates, closes = daily_closes(conn, secid_of[sym])
         if closes:
             closes_by_symbol[sym] = closes
             if dates:

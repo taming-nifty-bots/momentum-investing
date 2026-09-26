@@ -6,8 +6,9 @@ RUN apt-get update -y && apt-get upgrade -y
 ENV TZ=Asia/Calcutta
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Non-secret defaults (secrets - CONNECTION_STRING, INTEGRATE_*, TOTP, slack_token -
-# are injected at runtime by the Container App job, never baked into the image).
+# Non-secret defaults (secrets - CONNECTION_STRING, DHAN_CLIENT_ID, DHAN_PIN,
+# DHAN_TOTP, slack_token - are injected at runtime by the Container App job,
+# never baked into the image).
 # LIVE stays 0 here; set LIVE=1 in the job env only after go-live sign-off.
 ENV MONGO_DB="Bots"
 ENV user_name="sugam"

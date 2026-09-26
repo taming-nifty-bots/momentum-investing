@@ -1,8 +1,8 @@
-# ETF Momentum Rotation - Live (Definedge / Integrate)
+# ETF Momentum Rotation - Live (Dhan)
 
 A live-deployable port of the validated **"Final" ETF Momentum Rotation strategy**
 (backtest config `21 / 4 / 7`, trailing 8% stop, no mid-month refill). Same stack
-as the author's other live strategies: **Definedge / Integrate via the
+as the author's other live strategies: **Dhan via the
 `tamingnifty` package** with **MongoDB** as the ledger, split into two small,
 self-contained, scheduled container jobs.
 
@@ -17,7 +17,7 @@ Every number below is a 1:1 transcription of the validated engine (`bt_v2.py`,
 
 | Rule | Value |
 |------|-------|
-| Universe | 28 curated, liquidity-screened NSE ETFs (+ one liquid-cash park) |
+| Universe | 27 curated, liquidity-screened NSE ETFs (+ one liquid-cash park) |
 | Momentum | close-to-close return over **21 trading days** (candles, not calendar) |
 | Eligibility | momentum **strictly > 0**, else not rankable (no SMA regime gate) |
 | Holdings | **4**, equal-weight of *freed cash* on entry |
@@ -45,9 +45,14 @@ The backtest processes each day as **(1) apply stop exits at the open -> (2) on 
 month boundary, rebalance**. Live, that is split into two scheduled jobs so
 decisions are made on completed candles and fills happen at the next open:
 
-- **`signal/`** - runs **after the close**. Analysis only, never places an order.
-  Updates each holding's trailing peak and flags stop breaches, ranks the 28
+- **`signal/`** - runs **early, before the open**, on the previous session's
+  completed daily candles. Analysis only, never places an order.
+  Updates each holding's trailing peak and flags stop breaches, ranks the 27
   ETFs, and writes a provisional monthly-rebalance plan to Mongo.
+  *(It ran after the close under Definedge. Dhan publishes a session's daily
+  candle too late for that - on 2026-09-25 the day's bar still did not exist at
+  22:57 - so it moved to the following morning. Same completed candles either
+  way, so the decisions are unchanged.)*
 - **`momentum/`** - runs **at/just after the open**. The only job that trades.
   Sells stop-flagged holdings, **deploys any new entries deferred from the
   previous rebalance** (T+1 settled cash), and on the first session of a new
@@ -61,7 +66,7 @@ rebalance. Each folder is a standalone job (own `Dockerfile` + `requirements.txt
 
 ## Settlement: T+1 (buy same-day if nothing sold, else enter next day)
 
-The broker (Definedge) runs a **strict T+1 settlement cycle** - the cash freed by
+The broker (Dhan) runs a **strict T+1 settlement cycle** - the cash freed by
 a same-day **sell** is **not usable to buy** until the next session. So on a
 rebalance the new-entry buys branch on whether anything was **sold today**:
 
@@ -96,7 +101,7 @@ Shared, read by both jobs (seeded once; already populated in prod):
 
 | Collection | `_id` | Contents |
 |------------|-------|----------|
-| `etf_universe` | symbol | `{symbol, tsym, secid, bucket, name, is_park}` - 28 ETFs + `LIQUIDCASE` |
+| `etf_universe` | symbol | `{symbol, tsym, secid, bucket, name, is_park}` - 27 ETFs + `LIQUIDCASE` |
 | `etf_params` | `params` | `lookback, n_hold, top_retain, stop_pct, rebalance, sizing, refill_on_stop, momentum_min, exchange, series, product_type, order_type, cost_per_side, start_capital` |
 
 Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
@@ -111,8 +116,8 @@ Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 ```
 momentum-investing/
 |-- signal/
-|   |-- momentum_signal.py   # evening analysis job (ranking + stops + plan, no orders)
-|   |-- requirements.txt     # all deps (incl. tamingnifty==1.0.9)
+|   |-- momentum_signal.py   # morning analysis job (ranking + stops + plan, no orders)
+|   |-- requirements.txt     # all deps (incl. tamingnifty==2.1.0)
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)
 |-- momentum/
@@ -131,7 +136,7 @@ them directly in the `Bots` DB.
 ## Running
 
 ```bash
-# SIGNAL - after the close (writes peaks, stop flags, and the rebalance plan)
+# SIGNAL - early morning (writes peaks, stop flags, and the rebalance plan)
 docker build -t etf-signal ./signal
 docker run --rm --env-file signal/.env etf-signal
 
@@ -141,7 +146,9 @@ docker run --rm --env-file momentum/.env etf-momentum
 ```
 
 In production these are cron-scheduled Azure Container App Jobs (see the CI/CD
-workflow): `signal` after the close, `momentum` shortly after the open, Mon-Fri.
+workflow): `signal` early in the morning, `momentum` shortly after the open,
+Mon-Fri. `signal` **must** finish before `momentum` starts - `momentum` acts on
+the plan and the stop flags that `signal` writes.
 
 ## Safety
 
@@ -168,7 +175,10 @@ workflow): `signal` after the close, `momentum` shortly after the open, Mon-Fri.
   port reproduces the engine's rebalance decisions except for a handful of
   marginal whole-unit / cost-buffer buys over 3 years (benign, +2.25% on the
   ledger). T+1 costs ~3 CAGR points vs same-day (engine 55.9% vs 58.9%).
-- **Symbols** verified against the Definedge public master: all 28 ETFs + park
-  resolve as `<SYMBOL>-EQ` with token == secid (29/29 OK).
+- **Symbols** verified against the Definedge public master: all 27 ETFs + park
+  resolve as `<SYMBOL>-EQ` with token == secid (28/28 OK). Re-verified against
+  Dhan's NSE cash scrip master on 2026-09-25 for the broker move: all 28 stored
+  `secid` values match Dhan's `SECURITY_ID` exactly (0 mismatch, 0 missing), so
+  the universe needed no change.
 - **Not** yet validated: live broker fills, slippage, real-world execution - those
   only come from the dry-run forward test.

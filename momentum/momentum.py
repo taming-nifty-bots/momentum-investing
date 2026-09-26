@@ -20,7 +20,7 @@ The only job that places orders. It does, in this order:
      tomorrow, so record the new entries + a freed-cash snapshot as a pending
      buy, to be deployed the NEXT session (see T+1 below).
 
-T+1 settlement: the broker (Definedge) settles equity delivery on a strict T+1
+T+1 settlement: the broker (Dhan) settles equity delivery on a strict T+1
 cycle, so the cash freed by a same-day SELL is NOT usable to buy the same day.
 The rebalance therefore only defers its new-entry buys when it actually sold
 something that day (a stop or a rotation); those deferred buys fill the NEXT
@@ -45,7 +45,7 @@ from datetime import datetime
 from pymongo import MongoClient
 from dotenv import find_dotenv, load_dotenv
 from slack_sdk import WebClient
-from tamingnifty import connect_definedge as edge
+from tamingnifty import connect_dhan as edge
 from tamingnifty import utils as util
 
 load_dotenv(find_dotenv())
@@ -107,9 +107,13 @@ def load_universe():
     if not docs:
         notify("MOMENTUM ABORT: etf_universe is empty - seed etf_universe in Mongo first.")
         raise SystemExit(1)
+    # secid is the NSE exchange token, which is also Dhan's securityId for cash
+    # equity - the same number that was already stored for Definedge, so nothing
+    # in etf_universe had to change for the broker move.
+    secid_of = {d["symbol"]: d["secid"] for d in docs}
     tsym_of = {d["symbol"]: d["tsym"] for d in docs}
     bucket_of = {d["symbol"]: d["bucket"] for d in docs}
-    return tsym_of, bucket_of
+    return secid_of, tsym_of, bucket_of
 
 
 # --- ledger (accounts / meta / plan live in the positions collection by _id) --
@@ -178,76 +182,85 @@ def active_positions():
 
 
 # --- broker (LTP + order placement, DRY-RUN gated) ----------------------------
-def last_daily_close(conn, exchange, tsym):
+# Dhan identifies an instrument by securityId, not by trading symbol, so every
+# broker call below takes a secid. The tsym is still carried alongside it purely
+# because it is readable in Slack messages and in Mongo.
+def last_daily_close(conn, secid):
     from datetime import timedelta
     end = datetime.now()
-    df = edge.fetch_historical_data(conn, exchange, tsym, end - timedelta(days=15), end, "day")
+    df = edge.fetch_equity_data(conn, secid, end - timedelta(days=15), end, "day")
     if df is None or len(df) == 0 or "close" not in df.columns:
         return None
     return float(df["close"].iloc[-1])
 
 
-def ltp(conn, exchange, tsym):
+def ltp(conn, secid):
     try:
-        price = edge.fetch_ltp(conn, exchange, tsym)
+        price = edge.get_equity_ltp(conn, secid)
         if price:
             return float(price)
     except Exception:
         pass
-    return last_daily_close(conn, exchange, tsym)
+    return last_daily_close(conn, secid)
 
 
 def simulated_order(tsym, side, qty, price):
+    # Same shape as a real Dhan order dict, so the code that reads it does not
+    # have to care which branch produced it.
     return {
-        "order_id": f"DRYRUN-{side}-{tsym}-{datetime.now():%H%M%S}",
-        "order_status": "DRYRUN", "order_type": side, "tradingsymbol": tsym,
-        "quantity": qty, "filled_qty": qty,
-        "average_traded_price": round(price, 2) if price else 0.0,
-        "price_type": "MARKET", "product_type": "CNC",
+        "orderId": f"DRYRUN-{side}-{tsym}-{datetime.now():%H%M%S}",
+        "orderStatus": "DRYRUN", "transactionType": side, "tradingSymbol": tsym,
+        "quantity": qty, "filledQty": qty,
+        "averageTradedPrice": round(price, 2) if price else 0.0,
+        "orderType": "MARKET", "productType": "CNC",
         "message": "dry-run: no order sent to broker",
-        "order_entry_time": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+        "createTime": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
     }
 
 
-def place_market(conn, exchange, tsym, side, qty):
+def place_market(conn, secid, tsym, side, qty):
     """CNC MARKET order for `qty` units of `tsym`. DRY RUN unless LIVE=1."""
     side = side.upper()
     if qty is None or qty <= 0:
         raise ValueError(f"place_market: non-positive qty {qty} for {tsym}")
 
     if not LIVE:
-        return simulated_order(tsym, side, qty, ltp(conn, exchange, tsym))
+        return simulated_order(tsym, side, qty, ltp(conn, secid))
 
-    order_type = conn.ORDER_TYPE_BUY if side == "BUY" else conn.ORDER_TYPE_SELL
-    io = edge.IntegrateOrders(conn)
-    order = io.place_order(
-        exchange=conn.EXCHANGE_TYPE_NSE, order_type=order_type, price=0,
-        price_type=conn.PRICE_TYPE_MARKET, product_type=conn.PRODUCT_TYPE_CNC,
-        quantity=int(qty), tradingsymbol=tsym,
-    )
-    order_id = order["order_id"]
-    order = io.order(order_id)
-    if order.get("order_status") != "COMPLETE":
-        time.sleep(2)
-        order = io.order(order_id)
-    return order
+    try:
+        order = edge.place_equity_order(conn, secid, side, int(qty))
+    except Exception as exc:
+        # Dhan answers a bad order with an HTTP error, which the library raises.
+        # A rejection is an expected outcome here (a deferred buy whose funds have
+        # still not settled), and the caller needs a dict it can inspect, so turn
+        # the exception back into one rather than letting the whole job die.
+        return {"orderStatus": "REJECTED", "message": str(exc)}
+    return edge.wait_for_fill(conn, order["orderId"])
 
 
 def filled(order):
-    return order.get("order_status") in ("COMPLETE", "DRYRUN")
+    return order.get("orderStatus") in ("TRADED", "DRYRUN")
+
+
+def why_failed(order):
+    return order.get("omsErrorDescription") or order.get("message") or order.get("orderStatus")
 
 
 # --- trade actions (accounting invariants preserved exactly from the engine) --
-def sell(conn, exchange, params, pos, reason):
+def sell(conn, params, secid_of, pos, reason):
     """Market-sell a full position, realize P&L and update the ledger."""
     sym, qty = pos["symbol"], pos["quantity"]
     tsym = pos.get("tsym") or f"{sym}-{params.get('series', 'EQ')}"
-    order = place_market(conn, exchange, tsym, "SELL", qty)
+    secid = pos.get("secid") or secid_of.get(sym)
+    if not secid:
+        notify(f"MOMENTUM: SELL SKIPPED {sym} - no secid on the position or in etf_universe.")
+        return 0.0
+    order = place_market(conn, secid, tsym, "SELL", qty)
     orders.insert_one(dict(order))
     if not filled(order):
-        notify(f"MOMENTUM: SELL FAILED {sym} - {order.get('message')}")
+        notify(f"MOMENTUM: SELL FAILED {sym} - {why_failed(order)}")
         return 0.0
-    avg = float(order["average_traded_price"])
+    avg = float(order["averageTradedPrice"])
     entry = float(pos["entry_price"])
     cap = float(pos["capital_deployed"])
     pnl = round((avg - entry) * qty, 2)
@@ -274,10 +287,10 @@ def sell(conn, exchange, params, pos, reason):
     return round(avg * qty, 2)
 
 
-def buy(conn, exchange, params, sym, tsym, bucket, alloc):
+def buy(conn, params, sym, secid, tsym, bucket, alloc):
     """Market-buy `alloc` rupees of `sym`, floored to whole units, and record it."""
     cost = float(params["cost_per_side"])
-    price = ltp(conn, exchange, tsym)
+    price = ltp(conn, secid)
     if not price or price <= 0:
         notify(f"MOMENTUM: no price for {sym}; skipping buy")
         return None                                     # local skip (not a broker rejection)
@@ -285,12 +298,12 @@ def buy(conn, exchange, params, sym, tsym, bucket, alloc):
     if qty <= 0:                                        # skip if the slice buys 0 units
         notify(f"MOMENTUM: alloc Rs{alloc:.0f} buys 0 units of {sym}; skipping")
         return None                                     # local skip (not a broker rejection)
-    order = place_market(conn, exchange, tsym, "BUY", qty)
+    order = place_market(conn, secid, tsym, "BUY", qty)
     orders.insert_one(dict(order))
     if not filled(order):
-        notify(f"MOMENTUM: BUY FAILED {sym} - {order.get('message')}")
+        notify(f"MOMENTUM: BUY FAILED {sym} - {why_failed(order)}")
         return False                                    # broker rejected (e.g. funds unsettled)
-    avg = float(order["average_traded_price"])
+    avg = float(order["averageTradedPrice"])
     spend = round(avg * qty, 2)
 
     acc = get_accounts(params)
@@ -301,7 +314,7 @@ def buy(conn, exchange, params, sym, tsym, bucket, alloc):
     save_accounts(acc)
 
     positions.insert_one({
-        "symbol": sym, "tsym": tsym, "bucket": bucket,
+        "symbol": sym, "secid": secid, "tsym": tsym, "bucket": bucket,
         "entry_price": avg, "quantity": qty, "capital_deployed": spend,
         "entry_date": str(today()), "peak": avg, "status": "active",
         "marked_for_exit": False, "exit_reason": "",
@@ -312,7 +325,7 @@ def buy(conn, exchange, params, sym, tsym, bucket, alloc):
     return True
 
 
-def place_new_entries(conn, exchange, params, tsym_of, bucket_of, new_entries, available, label):
+def place_new_entries(conn, params, secid_of, tsym_of, bucket_of, new_entries, available, label):
     """Buy `new_entries` now, splitting `available` cash equally across them, each
     slice floored to whole units (matches the engine's equal-weight day snapshot).
 
@@ -323,8 +336,12 @@ def place_new_entries(conn, exchange, params, tsym_of, bucket_of, new_entries, a
     alloc_each = available / len(new_entries)
     for sym in new_entries:
         time.sleep(1)
+        secid = secid_of.get(sym)
+        if not secid:
+            notify(f"MOMENTUM: {sym} is not in etf_universe (no secid); skipping")
+            continue
         tsym = tsym_of.get(sym, f"{sym}-{params.get('series', 'EQ')}")
-        result = buy(conn, exchange, params, sym, tsym, bucket_of.get(sym, ""), alloc_each)
+        result = buy(conn, params, sym, secid, tsym, bucket_of.get(sym, ""), alloc_each)
         if result is False:                             # broker rejected the order
             notify(f"MOMENTUM: buy REJECTED for {label} - broker declined "
                    f"(e.g. funds unsettled). Skipping the remaining new entries.")
@@ -332,7 +349,7 @@ def place_new_entries(conn, exchange, params, tsym_of, bucket_of, new_entries, a
     return True
 
 
-def deploy_pending_buys(conn, exchange, params, tsym_of, bucket_of):
+def deploy_pending_buys(conn, params, secid_of, tsym_of, bucket_of):
     """Deploy the new entries deferred from the previous rebalance session.
 
     T+1 settlement means the cash freed by the rebalance-day sells is only usable
@@ -358,7 +375,7 @@ def deploy_pending_buys(conn, exchange, params, tsym_of, bucket_of):
 
     notify(f"MOMENTUM: deploying deferred entries for {month} (T+1 settled) | "
            f"new={new_entries} | cash_snapshot=Rs{available:.0f}")
-    ok = place_new_entries(conn, exchange, params, tsym_of, bucket_of,
+    ok = place_new_entries(conn, params, secid_of, tsym_of, bucket_of,
                            new_entries, available, f"{month} deferred (T+1)")
     if not ok:
         notify(f"MOMENTUM: day-2 funds still unsettled for {month} - dropping the pending "
@@ -385,10 +402,14 @@ def main():
     mode = "LIVE" if LIVE else "DRY-RUN"
     params = load_params()
     exchange = params["exchange"]
-    tsym_of, bucket_of = load_universe()
+    secid_of, tsym_of, bucket_of = load_universe()
 
-    conn = edge.login_to_integrate()
+    conn = edge.login_to_dhan()
     notify(f"MOMENTUM started [{mode}] ({exchange})")
+    # Dhan only accepts orders from a whitelisted static IP, so print the address
+    # this container actually goes out on - it is the first thing to check when
+    # orders start getting refused.
+    notify(f"MOMENTUM public IP: {util.get_public_ip()}")
 
     # 1. On the first session of a new month, decide the rebalance and flag its
     #    rotations. A rotation is any holding the signal job did NOT retain (it
@@ -428,12 +449,12 @@ def main():
     for pos in active_positions():
         if pos.get("marked_for_exit"):
             time.sleep(1)
-            sell(conn, exchange, params, pos, pos.get("exit_reason") or "trailing_stop")
+            sell(conn, params, secid_of, pos, pos.get("exit_reason") or "trailing_stop")
             sold_today = True
 
     # 3. Deploy any new entries deferred from a PREVIOUS rebalance session (their
     #    freed cash has now settled under T+1).
-    deploy_pending_buys(conn, exchange, params, tsym_of, bucket_of)
+    deploy_pending_buys(conn, params, secid_of, tsym_of, bucket_of)
 
     # 4. Place this rebalance's new entries. Under T+1 the cash freed by today's
     #    sells does not settle until tomorrow, so:
@@ -453,7 +474,7 @@ def main():
         else:
             notify(f"MOMENTUM: no exits today -> buying {len(new_entries)} new entries now "
                    f"(settled cash) | new={new_entries} | cash=Rs{available:.0f}")
-            place_new_entries(conn, exchange, params, tsym_of, bucket_of,
+            place_new_entries(conn, params, secid_of, tsym_of, bucket_of,
                               new_entries, available, f"{current_month} same-day")
         set_meta(last_rebalanced_month=current_month, last_momentum_date=str(today()))
     else:
