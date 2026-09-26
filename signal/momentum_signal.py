@@ -1,47 +1,19 @@
 """
 ETF Momentum Rotation - SIGNAL job (runs once a day, before the open).
 
-EVERY decision the strategy makes is made here. This job never places an order;
-the momentum job places orders and decides nothing. The two never call each
-other - they meet only at two fields in Mongo:
+Every decision the strategy makes is made here; the momentum job places the
+orders and decides nothing. They never call each other - they meet at two fields
+in Mongo: marked_for_exit (this job sets it, momentum sells it) and plan.target
+(this job writes it, momentum buys whatever is missing).
 
-    marked_for_exit   this job sets it, the momentum job sells whatever carries it
-    plan.target       this job writes it, the momentum job buys whatever is missing
+  1. Trailing stops - EVERY session.
+  2. Ranking, rotations and the target - ONLY when a rebalance is due.
 
-  1. Trailing stops - EVERY session. Update each holding's peak (highest daily
-     close since entry) and flag it marked_for_exit if the close has fallen
-     STOP_PCT below that peak. A stopped name is also removed from the target,
-     which is what stops the momentum job buying it straight back.
-  2. Ranking, rotations and the target - ONLY when a rebalance is due. Rank the
-     universe, work out what to keep and what to buy, flag the holdings that fell
-     out of the band with the SAME marked_for_exit flag, and write the target
-     book. Then stamp the month, so this step does not run again until the next
-     one.
+Parameters are constants below; the universe is read from etf_universe in Mongo.
 
-Rotations and stops share one flag on purpose. To the momentum job an exit is an
-exit; the reason is a label for the ledger, not something it acts on.
-
-The target is a desired STATE, not an instruction. The momentum job compares what
-is held against it and buys the difference, so re-reading it is harmless, a
-missed run costs nothing but time, and a half-finished one is picked up by the
-next session. That is also what makes T+1 work without any bookkeeping: the
-momentum job sells on day 1 and stops, and buys the still-missing names on day 2.
-
-The two steps run on different clocks because a stop can break on ANY session
-while a rotation happens once a month. Skipping step 2 changes no decision - the
-rank is read only at the rebalance - and saves ~24 of the ~28 Dhan calls a day.
-
-The universe is read from MongoDB (etf_universe); the strategy parameters are
-constants below. Like the other strategies: one self-contained file, tamingnifty
-for the broker and Slack, MongoDB as the ledger.
-
-SCHEDULING: everything here is driven by DAILY candles, so this job must not act
-on a session until that session's daily bar has been published. It runs the
-MORNING AFTER the session it is acting on (before the momentum job), which is
-early enough to be safe regardless of how soon after the close Dhan publishes.
-How soon that actually is has NOT been measured - the one observation we have is
-that the 2026-09-25 bar was absent at 22:57 that night and present by 12:03 the
-next day, which brackets it to a 13-hour window and proves nothing narrower.
+See README.md for the design - why the two steps run on different clocks, why
+rotations and stops share one flag, and why the target is a state rather than an
+instruction.
 """
 import os
 import time
@@ -68,25 +40,14 @@ universe_coll = db["etf_universe"]
 positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing else
 state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
 
-# --- strategy parameters ------------------------------------------------------
-# A 1:1 transcription of the validated engine (bt_v2.py, FINALCFG). These used to
-# sit in an etf_params document in Mongo, which meant the strategy could be
-# changed without a code change and without leaving a trace. They are constants
-# here instead, so git history IS the audit trail: changing one is a commit, a
-# review and a redeploy, which is the correct amount of friction for numbers that
-# define the strategy. The 28-ETF universe stays in Mongo - that is data, not a
-# rule, and it is edited far more often.
+# --- strategy parameters (1:1 from the validated engine bt_v2.py, FINALCFG) ---
 LOOKBACK = 21          # momentum window, in trading days
 N_HOLD = 4             # target number of holdings
 TOP_RETAIN = 7         # keep a holding while its rank is <= this
 STOP_PCT = 0.08        # trailing stop, below the peak daily close
 MOMENTUM_MIN = 0.0     # eligibility: momentum must be STRICTLY above this
 
-# Which session is "now" is a property of the MARKET, not of what we happen to
-# hold, so the freshness guard asks one liquid name for the latest daily bar
-# rather than inferring it from the bulk fetch. NIFTYBEES is the most heavily
-# traded ETF on the NSE and will have a bar for every session; if it is ever
-# missing from etf_universe we fall back to the first candidate.
+# The freshness guard asks this one liquid name which session is the newest.
 CALENDAR_REF = "NIFTYBEES"
 
 
@@ -158,13 +119,12 @@ def stop_hit(current_close, peak, stop_pct):
 def select_rebalance(held, ranked, rank_of, buckets, n_hold, top_retain):
     """
     Monthly rebalance selection (bt_v2 lines 284-300):
-      retained    = held names still ranked <= top_retain, one per bucket (kept)
+      retained    = held names still ranked <= top_retain, one per bucket
       new_entries = best-ranked eligible names filling the remaining slots,
-                    one per bucket, skipping buckets already used (bought)
+                    one per bucket, skipping buckets already used
 
-    Anything held that is NOT retained is a rotation exit. There is no separate
-    rotate_out return value: the caller derives it as "held and not retained" and
-    flags those positions marked_for_exit, the same flag a trailing stop sets.
+    Anything held that is NOT retained is a rotation exit; the caller derives it
+    as "held and not retained".
     """
     retained, used = [], set()
     for sym in held:
@@ -191,10 +151,8 @@ def select_rebalance(held, ranked, rank_of, buckets, n_hold, top_retain):
 
 
 # --- market data (Dhan daily candles via tamingnifty) -------------------------
-# Dhan rate-limits the data API. Walking all 28 ETFs back to back with no pause
-# gets most of the calls refused with DH-904 (measured 2026-09-25: 17 of 27 failed
-# at no sleep, 0 failed at 0.25s), so every candle request waits first. At half a
-# second the whole universe still takes under 20 seconds.
+# Dhan rate-limits the data API - without a pause most calls come back DH-904
+# (measured 2026-09-25: 17 of 27 failed at no sleep, 0 failed at 0.25s).
 PAUSE_BETWEEN_CALLS = 0.5
 
 
@@ -216,17 +174,8 @@ def daily_closes(conn, secid, lookback_days=400):
 
 def fetch_into(conn, series_of, wanted):
     """Fetch the daily series for every (symbol, secid) in `wanted` we do not
-    already have, adding them to `series_of` in place.
-
-    The run builds `series_of` up in stages - the calendar reference first, then
-    the holdings, then (only on a rebalance) the rest of the universe - and each
-    stage skips what an earlier one already fetched. So a name that is both held
-    and ranked still costs exactly one Dhan call, and an ordinary day never pays
-    for the 24-odd candidates nothing is going to read.
-
-    A symbol with no secid is skipped rather than fetched: a holding that has
-    dropped out of etf_universe carries its own secid on the position document,
-    which is what the caller passes in.
+    already have, adding them to `series_of` in place. Skipping what is already
+    there is what keeps a name that is both held and ranked to one Dhan call.
     """
     for sym, secid in wanted:
         if sym in series_of or not secid:
@@ -263,11 +212,8 @@ def set_meta(**fields):
 def drop_from_target(sym):
     """Take a stopped name out of the plan's target.
 
-    The momentum job buys whatever the target says is missing, so this one line
-    IS the no-mid-month-refill rule: remove the name and there is no longer a
-    gap for it to fill. Leave it in and the next session would buy it straight
-    back, which the strategy explicitly forbids - the freed cash has to sit idle
-    until the next rebalance.
+    Momentum buys whatever the target says is missing, so removing the name here
+    IS the no-mid-month-refill rule. See README.md.
     """
     plan = state.find_one({"_id": "plan"})
     if not plan:
@@ -301,19 +247,8 @@ def main():
     notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={LOOKBACK}, stop={STOP_PCT*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
-    # 1. Freshness guard, on a SINGLE candle. Everything below decides one thing:
-    #    what to do about the session whose daily bar is the newest one Dhan has.
-    #    If that is the bar the previous run already acted on there is nothing new
-    #    to decide - so stop, rather than redo the stops or (the real hazard)
-    #    re-decide on a stale bar because the latest one is not published yet.
-    #    This makes the cron slot a performance question instead of a correctness
-    #    one, and makes the job safe to re-run by hand.
-    #
-    #    Asking ONE liquid name costs a single Dhan call, so the common "not
-    #    published yet" case - the very case this guard exists for - now exits in
-    #    about a second instead of walking the whole universe first. The candle
-    #    date and the wall clock are logged every run, so the Slack history
-    #    measures Dhan's real publish lag for free.
+    # 1. Freshness guard, on a SINGLE candle: if the newest bar Dhan has is the
+    #    one the last run already acted on, there is nothing new to decide.
     ref = CALENDAR_REF if CALENDAR_REF in secid_of else candidates[0]
     series_of = {}
     fetch_into(conn, series_of, [(ref, secid_of[ref])])
@@ -330,8 +265,7 @@ def main():
         notify("SIGNAL: no new candle since the last run - nothing to do.")
         return
 
-    # 2. Trailing-stop maintenance - EVERY day. A stop can break on any session,
-    #    so this runs unconditionally, and it only needs the holdings' candles.
+    # 2. Trailing stops - EVERY day. A stop can break on any session.
     active = list(positions.find({"status": "active"}))
     fetch_into(conn, series_of, holdings_to_fetch(active, secid_of))
     stopped_now = []
@@ -363,17 +297,8 @@ def main():
                    f"({(last/peak-1)*100:.1f}% from peak) -> sell at next open")
         positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields})
 
-    # 3. Ranking - ONLY when a rebalance is actually due. Holdings rotate once a
-    #    month, and the rank is read at exactly one moment: that rebalance, for
-    #    the retain band and the new entries. Ranking all 28 ETFs on the other ~20
-    #    sessions computes a number nothing consumes, at 28 rate-limited calls a
-    #    run. Skipping it changes no decision the strategy makes.
-    #
-    #    last_rebalanced_month is stamped by the MOMENTUM job when it finishes a
-    #    rebalance, so this condition stays true until the plan has actually been
-    #    consumed: if momentum does not run on the 1st, signal keeps refreshing
-    #    the plan every session until it does. That is also what keeps the plan
-    #    young enough for momentum's PLAN_MAX_AGE_DAYS check.
+    # 3. Ranking - ONLY when a rebalance is due. The rank is read at exactly one
+    #    moment, so computing it daily would cost 28 calls for nothing.
     current_month = month_key()
     if current_month == get_meta().get("last_rebalanced_month"):
         set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()))
@@ -391,8 +316,7 @@ def main():
         if closes:
             closes_by_symbol[sym] = closes
 
-    # The rebalance is decided on this ranking, so a run that silently lost half
-    # the universe to rate limiting must not be allowed to write a plan from it.
+    # Never plan off a universe that rate limiting has eaten half of.
     if len(closes_by_symbol) < len(candidates):
         missing = [s for s in candidates if s not in closes_by_symbol]
         notify(f"SIGNAL: WARNING - no candles for {len(missing)} candidate(s): {missing}")
@@ -404,16 +328,13 @@ def main():
 
     ranked, rank_of, mom_of = rank_universe(closes_by_symbol, LOOKBACK, MOMENTUM_MIN)
 
-    # The plan is computed on the holdings that survive tonight's stops (they sell
-    # at the open before the rebalance is evaluated - matches the engine's order).
+    # Stops sell at the open, before the rebalance is evaluated (engine order).
     held_after_stops = [p["symbol"] for p in active if p["symbol"] not in stopped_now]
     retained, new_entries = select_rebalance(
         held_after_stops, ranked, rank_of, bucket_of, N_HOLD, TOP_RETAIN)
 
-    # Flag the rotations. Anything held that the ranking did not retain has fallen
-    # out of the band, so it goes out - marked with the SAME flag a trailing stop
-    # uses, because the momentum job is not supposed to know the difference. It
-    # sells what is flagged; deciding what deserves flagging is this job's work.
+    # Rotations: held but not retained. Same flag a trailing stop sets, so the
+    # momentum job never has to tell the two apart.
     rotations = [p["symbol"] for p in active
                  if p["symbol"] not in retained and p["symbol"] not in stopped_now
                  and not p.get("marked_for_exit")]
@@ -422,11 +343,8 @@ def main():
                              {"$set": {"marked_for_exit": True,
                                        "exit_reason": "rebalance"}})
 
-    # target = the book we want to be holding once this rebalance has played out.
-    # The momentum job buys whatever of it is missing, so it is a desired STATE,
-    # not an instruction: re-reading it is harmless, and a run that is skipped or
-    # half-finished is simply picked up by the next one. Everything else in the
-    # plan is there to be read by a human in Mongo or Slack.
+    # target = the book we want to end up holding. Everything else in the plan is
+    # there to be read by a human in Mongo or Slack.
     plan = {
         "signal_date": str(signal_date),
         "generated_on": str(today()),
@@ -446,11 +364,8 @@ def main():
     }
     state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
 
-    # Stamp the month HERE, not in the momentum job. This job decided the
-    # rebalance, so this job records that it is decided; tomorrow it goes back to
-    # stops-only and the target stays frozen for the momentum job to work through
-    # over however many sessions T+1 needs. last_candle_date is the CANDLE this
-    # was decided on, not the day the job happened to run.
+    # This job decided the rebalance, so this job records that it is decided.
+    # last_candle_date is the CANDLE it was decided on, not the day we ran.
     set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()),
              last_rebalanced_month=current_month)
 

@@ -1,39 +1,18 @@
 """
 ETF Momentum Rotation - MOMENTUM job (runs once a day, at/just after the open).
 
-The only job that places orders, and it makes NO decisions. Every decision - what
-to stop out, what to rotate, what the book should hold - is made by the signal
-job the evening before and left in Mongo. This job reads two things and acts:
+The only job that places orders, and it makes no decisions. It reads two fields
+the signal job left in Mongo and acts on them:
 
     marked_for_exit   sell it, whatever the reason
-    plan.target       the book we should be holding; buy whatever is missing
+    plan.target       the book we should hold; buy whatever is missing
 
-Three steps:
+  1. Sell every holding flagged marked_for_exit.
+  2. Sold anything? STOP - Dhan settles T+1, so that cash is not usable today.
+  3. Otherwise buy whatever of the target we are not already holding.
 
-  1. Sell every holding flagged marked_for_exit. Trailing stops and rotations
-     both arrive with that flag, so this job never has to tell them apart - the
-     exit_reason is carried into the ledger as a label, nothing reads it.
-  2. If anything sold, STOP. Dhan settles equity delivery T+1, so the cash those
-     sells just freed cannot buy anything until the next session.
-  3. Nothing sold, so the cash we hold is settled: buy whatever the target says
-     is missing.
-
-The target is a desired STATE, not a shopping list, and that is what makes step 2
-safe to do. We never remember what to buy tomorrow - tomorrow we compare what we
-hold against the target again and the missing names are still missing. The same
-property retries every failure for free: a rejected sell stays flagged and is
-picked up next session, a rejected buy leaves the name missing so the next
-session tries again. No recovery path needs writing.
-
-A rebalance that sells nothing - the very first run, or a month whose holdings
-were all retained - skips step 2 and buys the same day. That falls out of the
-ordering; it is not a special case. A mid-month stop sells and stops, and buys
-nothing back, because the signal job took the stopped name out of the target -
-that is the no-refill rule.
-
-Cash gate (bt_v2 L369): new entries are funded only from the cash we have. A
-runaway winner that leaves ~0 cash means zero new names are bought - intended
-behaviour that keeps the book concentrated.
+See README.md for the design - why the target is a state rather than a shopping
+list, and how that makes T+1 and every retry fall out for free.
 
 SAFETY: orders are DRY RUN unless live_trading=true.
 """
@@ -63,11 +42,7 @@ positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing e
 state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
 orders = db[f"etf_orders_{user_name}"]
 
-# --- strategy parameters ------------------------------------------------------
 # The signal job owns the ranking/stop parameters; this job owns only the money.
-# Both used to live in an etf_params document in Mongo, which meant the strategy
-# could be changed without a code change and without leaving a trace. Constants
-# here instead, so git history IS the audit trail.
 START_CAPITAL = 400000.0
 
 
@@ -102,12 +77,9 @@ def load_universe():
 
 
 # --- ledger -------------------------------------------------------------------
-# Two collections, one shape each: etf_positions_<user> holds nothing but
-# position documents, and the accounts / meta / plan singletons live in
-# etf_state_<user>. They used to share a collection, which worked only
-# because the singletons happened to have no "status" field and so fell out of
-# find({"status": "active"}). That is a trap now that the ledger is DERIVED from
-# exactly those queries - one stray status field would silently skew the P&L.
+# Positions and the accounts / meta / plan singletons live in separate
+# collections: the ledger is DERIVED from find({"status": "active"}), so a stray
+# status field on a singleton would silently skew the P&L.
 def strip(doc):
     if doc is None:
         return None
@@ -119,17 +91,11 @@ def strip(doc):
 def compute_accounts():
     """Work the whole ledger out from the position documents themselves.
 
-    Nothing here is incremented. Every figure is derived from the positions, so
-    the ledger cannot drift away from them: if a run dies between placing an
-    order and updating a running total, the next run simply recomputes the
-    truth instead of carrying a wrong number forward for good.
-
-    The arithmetic is the same as the running totals it replaces:
-      invested       = capital still tied up in open positions
-      total_pnl      = realised P&L, i.e. the sum over closed positions
-      unused_balance = start capital, plus what we have made, minus what is
-                       currently deployed
-      total_balance  = start capital plus what we have made
+    Nothing is incremented, so the ledger cannot drift: a run that dies midway
+    is simply recomputed by the next one.
+      invested       = capital tied up in open positions
+      total_pnl      = realised P&L over closed positions
+      unused_balance = start + pnl - invested
     """
     start = START_CAPITAL
     active = list(positions.find({"status": "active"}))
@@ -177,9 +143,7 @@ def active_positions():
 
 
 # --- broker (LTP + order placement, DRY-RUN gated) ----------------------------
-# Dhan identifies an instrument by securityId, not by trading symbol, so every
-# broker call below takes a secid. The tsym is still carried alongside it purely
-# because it is readable in Slack messages and in Mongo.
+# Dhan keys everything by securityId; the tsym is carried only for readability.
 def last_daily_close(conn, secid):
     from datetime import timedelta
     end = datetime.now()
@@ -200,8 +164,7 @@ def ltp(conn, secid):
 
 
 def simulated_order(tsym, side, qty, price):
-    # Same shape as a real Dhan order dict, so the code that reads it does not
-    # have to care which branch produced it.
+    # Same shape as a real Dhan order dict, so callers need not care which.
     return {
         "orderId": f"DRYRUN-{side}-{tsym}-{datetime.now():%H%M%S}",
         "orderStatus": "DRYRUN", "transactionType": side, "tradingSymbol": tsym,
@@ -225,10 +188,8 @@ def place_market(conn, secid, tsym, side, qty):
     try:
         order = edge.place_equity_order(conn, secid, side, int(qty))
     except Exception as exc:
-        # Dhan answers a bad order with an HTTP error, which the library raises.
-        # A rejection is an expected outcome here (a deferred buy whose funds have
-        # still not settled), and the caller needs a dict it can inspect, so turn
-        # the exception back into one rather than letting the whole job die.
+        # A rejection is an expected outcome (unsettled funds), and Dhan raises it
+        # as an HTTP error - hand the caller a dict instead of killing the job.
         return {"orderStatus": "REJECTED", "message": str(exc)}
     return edge.wait_for_fill(conn, order["orderId"])
 
@@ -303,12 +264,11 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
 
 def place_new_entries(conn, secid_of, tsym_of, bucket_of, new_entries, available):
     """Buy `new_entries` now, splitting `available` cash equally across them, each
-    slice floored to whole units (matches the engine's equal-weight day snapshot).
+    slice floored to whole units (matches the engine's equal-weight snapshot).
 
-    Returns True if all names were placed; False if the broker REJECTED one - the
-    remaining names are then skipped and simply bought by a later session, since
-    they are still missing from the target. A local skip (no price / slice buys 0
-    units) is not a rejection and does not stop the loop.
+    Stops at a broker REJECTION; the skipped names stay missing from the target,
+    so a later session buys them. A local skip (no price / 0 units) is not a
+    rejection and does not stop the loop.
     """
     alloc_each = available / len(new_entries)
     for sym in new_entries:
@@ -348,14 +308,9 @@ def main():
 
     conn = edge.login_to_dhan()
     notify(f"MOMENTUM started [{mode}] (NSE)")
-    # Dhan only accepts orders from a whitelisted static IP, so print the address
-    # this container actually goes out on - it is the first thing to check when
-    # orders start getting refused.
-    notify(f"MOMENTUM public IP: {util.get_public_ip()}")
+    notify(f"MOMENTUM public IP: {util.get_public_ip()}")   # must be whitelisted
 
-    # 1. Sell everything the signal job flagged. A trailing stop and a rotation
-    #    carry the same flag, so one loop handles both and this job never has to
-    #    ask which is which.
+    # 1. Sell everything the signal job flagged - stops and rotations alike.
     sold_today = []
     for pos in active_positions():
         if pos.get("marked_for_exit"):
@@ -363,18 +318,15 @@ def main():
             sell(conn, secid_of, pos, pos.get("exit_reason") or "trailing_stop")
             sold_today.append(pos["symbol"])
 
-    # 2. Sold something? Stop. Dhan settles T+1, so that cash is not usable until
-    #    the next session and there is nothing we could buy with it today. We do
-    #    not write down what to buy tomorrow - tomorrow's run compares the book
-    #    against the target again and finds the same names still missing.
+    # 2. Sold something? Stop - Dhan settles T+1. Nothing is written down for
+    #    tomorrow: the missing names will still be missing tomorrow.
     if sold_today:
         notify(f"MOMENTUM: sold {sold_today} today - T+1 means that cash is not usable "
                f"until the next session, so no entries today.")
         summary()
         return
 
-    # 3. Nothing sold, so whatever cash we hold is settled. Buy the names the
-    #    target says we should be holding and are not. Usually that is nothing.
+    # 3. Nothing sold, so our cash is settled - buy what the target is missing.
     plan = get_plan()
     if not plan:
         notify("MOMENTUM: no plan in Mongo yet - run the signal job first.")

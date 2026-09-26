@@ -175,6 +175,46 @@ a trap now that the ledger is **derived** from exactly those queries - one stray
 after every buy and sell (`compute_accounts`), so it self-heals and can never drift.
 Read it, don't write it.
 
+## Implementation notes
+
+Small operational facts that the code assumes. They live here rather than as
+comments so the jobs stay short enough to read in one screen.
+
+**Dhan rate-limits the data API.** Walking all 28 ETFs back to back with no pause
+gets most calls refused with `DH-904`; measured 2026-09-25, **17 of 27 failed at
+no sleep and 0 failed at 0.25s**. `PAUSE_BETWEEN_CALLS = 0.5` in
+`momentum_signal.py` waits before every candle request - at half a second the
+whole universe still finishes in under 20 seconds. This is the reason the
+ranking is monthly rather than daily: an ordinary session costs ~4 calls
+(reference + holdings) instead of ~29.
+
+**`signal` fetches in stages and never fetches the same name twice** - the
+calendar reference first, then the holdings, then (only on a rebalance) the rest
+of the universe, each stage skipping what an earlier one already pulled. A
+holding that has dropped out of `etf_universe` carries its own `secid` on the
+position document, so its stop keeps being maintained.
+
+**`secid` is the NSE exchange token, which is also Dhan's `securityId`** for cash
+equity - the universe needed no change for the broker move. Dhan keys orders and
+quotes by `securityId`, not by trading symbol; the `tsym` is carried alongside
+purely so Slack messages and Mongo docs are readable.
+
+**Dhan only accepts orders from a whitelisted static IP.** `momentum` prints the
+address the container actually egresses on at every run - that is the first thing
+to check when orders start getting refused.
+
+**A broker rejection is an expected outcome, not a crash.** Dhan answers a bad
+order with an HTTP error which the library raises; `place_market()` turns it back
+into a `{"orderStatus": "REJECTED"}` dict so the caller can inspect it and the
+job survives. Terminal success on Dhan is `TRADED`, not `COMPLETE`.
+
+**The strategy parameters are constants, not config.** They used to sit in an
+`etf_params` document in Mongo, which meant the strategy could be changed without
+a code change and without leaving a trace. As constants, git history is the audit
+trail and changing one costs a commit and a redeploy - the right amount of
+friction for numbers that define the strategy. The universe stays in Mongo
+because it is data, and it is edited far more often.
+
 ## Layout
 
 ```
