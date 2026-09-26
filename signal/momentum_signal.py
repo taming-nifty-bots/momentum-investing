@@ -218,7 +218,7 @@ def drop_from_target(sym):
     plan = state.find_one({"_id": "plan"})
     if not plan:
         return
-    target = [s for s in (plan.get("target") or []) if s != sym]
+    target = [t for t in (plan.get("target") or []) if t["symbol"] != sym]
     state.update_one({"_id": "plan"}, {"$set": {"target": target}})
 
 
@@ -343,13 +343,18 @@ def main():
                              {"$set": {"marked_for_exit": True,
                                        "exit_reason": "rebalance"}})
 
-    # target = the book we want to end up holding. Everything else in the plan is
-    # there to be read by a human in Mongo or Slack.
+    # target = the book we want to end up holding. It carries everything the
+    # momentum job needs to place the order, so that job never has to read
+    # etf_universe - a new entry has no position document to look it up on, and
+    # this is the moment we already have it resolved. Everything else in the plan
+    # is there to be read by a human in Mongo or Slack.
+    target = [{"symbol": sym, "secid": secid_of[sym], "tsym": tsym_of[sym],
+               "bucket": bucket_of[sym]} for sym in retained + new_entries]
     plan = {
         "signal_date": str(signal_date),
         "generated_on": str(today()),
         "for_month": current_month,
-        "target": retained + new_entries,
+        "target": target,
         "retained": retained,
         "new_entries": new_entries,
         "rotated_out": rotations,
@@ -373,7 +378,7 @@ def main():
            "retain={rt} | rotate={ro} | new={nw} | target={tg}".format(
                sd=plan["signal_date"], m=current_month, hb=plan["held_before"],
                st=stopped_now, rt=retained, ro=rotations, nw=new_entries,
-               tg=plan["target"]))
+               tg=[t["symbol"] for t in target]))
     if ranked:
         notify("SIGNAL ranking (top): " + ", ".join(
             f"{s}#{rank_of[s]}({mom_of[s]*100:.1f}%)" for s in ranked[:6]))

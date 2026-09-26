@@ -60,6 +60,12 @@ two fields in Mongo:
 | `marked_for_exit` on a position | `signal` | `momentum` sells it, whatever the reason |
 | `plan.target` | `signal` | `momentum` buys whatever of it is missing |
 
+Each target entry carries everything needed to place the order -
+`{symbol, secid, tsym, bucket}` - so `momentum` never reads `etf_universe` at
+all. It has to come from `signal`: a name we do not hold yet has no position
+document to look it up on, and `signal` has already resolved all three fields at
+the moment it writes the plan.
+
 - **`signal/`** - runs **early, before the open**, on the previous session's
   completed daily candles. Analysis only, never places an order. It does two
   things, on **two different clocks**:
@@ -155,7 +161,8 @@ Shared, read by both jobs (seeded once; already populated in prod):
 |------------|-------|----------|
 | `etf_universe` | symbol | `{symbol, tsym, secid, bucket, name, is_park}` - 27 ETFs + `LIQUIDCASE` |
 
-This is now the **only** shared collection. The strategy parameters are constants
+Read by `signal` only. `momentum` reads no shared collection - everything it
+needs to place an order reaches it on a position document or a target entry. The strategy parameters are constants
 in the job files (see *The strategy* above), so there is nothing else to seed.
 
 Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
@@ -163,7 +170,7 @@ Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 | Collection | Docs |
 |------------|------|
 | `etf_positions_<user>` | one doc per position, and **nothing else** |
-| `etf_state_<user>` | the three control singletons - `_id:accounts` (the ledger), `_id:meta` (`last_candle_date`, `last_rebalanced_month`, both written by `signal`), `_id:plan` (the rebalance plan; its `target` field is the book `momentum` reconciles towards, the rest is there to be read by a human) |
+| `etf_state_<user>` | the three control singletons - `_id:accounts` (the ledger), `_id:meta` (`last_candle_date`, `last_rebalanced_month`, both written by `signal`), `_id:plan` (the rebalance plan; its `target` is the book `momentum` reconciles towards - a list of `{symbol, secid, tsym, bucket}` - and the rest is there to be read by a human) |
 | `etf_orders_<user>` | one doc per placed/simulated order |
 
 The control docs used to share the positions collection, which worked only because
@@ -197,7 +204,9 @@ position document, so its stop keeps being maintained.
 **`secid` is the NSE exchange token, which is also Dhan's `securityId`** for cash
 equity - the universe needed no change for the broker move. Dhan keys orders and
 quotes by `securityId`, not by trading symbol; the `tsym` is carried alongside
-purely so Slack messages and Mongo docs are readable.
+purely so Slack messages and Mongo docs are readable. Every `secid` reaches
+`momentum` already resolved - on the position document for a sell, on the target
+entry for a buy - so the job that places orders never looks one up.
 
 **Dhan only accepts orders from a whitelisted static IP.** `momentum` prints the
 address the container actually egresses on at every run - that is the first thing

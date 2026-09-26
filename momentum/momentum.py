@@ -5,7 +5,8 @@ The only job that places orders, and it makes no decisions. It reads two fields
 the signal job left in Mongo and acts on them:
 
     marked_for_exit   sell it, whatever the reason
-    plan.target       the book we should hold; buy whatever is missing
+    plan.target       the book we should hold, each entry carrying its own
+                      secid/tsym/bucket; buy whatever is missing
 
   1. Sell every holding flagged marked_for_exit.
   2. Sold anything? STOP - Dhan settles T+1, so that cash is not usable today.
@@ -37,7 +38,6 @@ slack_client = WebClient(token=os.environ.get("slack_token"))
 
 mongo_client = MongoClient(CONNECTION_STRING)
 db = mongo_client[MONGO_DB]
-universe_coll = db["etf_universe"]
 positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing else
 state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
 orders = db[f"etf_orders_{user_name}"]
@@ -60,20 +60,6 @@ def today():
 
 def is_trading_day():
     return today().weekday() < 5      # Mon-Fri only (live)
-
-
-# --- universe (read from Mongo; fail loudly if unseeded) ----------------------
-def load_universe():
-    docs = list(universe_coll.find({"is_park": {"$ne": True}}))
-    if not docs:
-        notify("MOMENTUM ABORT: etf_universe is empty - seed etf_universe in Mongo first.")
-        raise SystemExit(1)
-    # secid is the NSE exchange token, which is also Dhan's securityId for cash
-    # equity.
-    secid_of = {d["symbol"]: d["secid"] for d in docs}
-    tsym_of = {d["symbol"]: d["tsym"] for d in docs}
-    bucket_of = {d["symbol"]: d["bucket"] for d in docs}
-    return secid_of, tsym_of, bucket_of
 
 
 # --- ledger -------------------------------------------------------------------
@@ -203,13 +189,13 @@ def why_failed(order):
 
 
 # --- trade actions (accounting invariants preserved exactly from the engine) --
-def sell(conn, secid_of, pos, reason):
+def sell(conn, pos, reason):
     """Market-sell a full position, realize P&L and update the ledger."""
     sym, qty = pos["symbol"], pos["quantity"]
     tsym = pos.get("tsym") or sym
-    secid = pos.get("secid") or secid_of.get(sym)
+    secid = pos.get("secid")
     if not secid:
-        notify(f"MOMENTUM: SELL SKIPPED {sym} - no secid on the position or in etf_universe.")
+        notify(f"MOMENTUM: SELL SKIPPED {sym} - no secid on the position document.")
         return 0.0
     order = place_market(conn, secid, tsym, "SELL", qty)
     orders.insert_one(dict(order))
@@ -262,23 +248,24 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
     return True
 
 
-def place_new_entries(conn, secid_of, tsym_of, bucket_of, new_entries, available):
-    """Buy `new_entries` now, splitting `available` cash equally across them, each
-    slice floored to whole units (matches the engine's equal-weight snapshot).
+def place_new_entries(conn, new_entries, available):
+    """Buy `new_entries` - target entries, each carrying its own secid/tsym/bucket
+    - splitting `available` cash equally across them, each slice floored to whole
+    units (matches the engine's equal-weight snapshot).
 
     Stops at a broker REJECTION; the skipped names stay missing from the target,
     so a later session buys them. A local skip (no price / 0 units) is not a
     rejection and does not stop the loop.
     """
     alloc_each = available / len(new_entries)
-    for sym in new_entries:
+    for entry in new_entries:
         time.sleep(1)
-        secid = secid_of.get(sym)
+        sym, secid = entry["symbol"], entry.get("secid")
         if not secid:
-            notify(f"MOMENTUM: {sym} is not in etf_universe (no secid); skipping")
+            notify(f"MOMENTUM: no secid on the target entry for {sym}; skipping")
             continue
-        tsym = tsym_of.get(sym, sym)
-        result = buy(conn, sym, secid, tsym, bucket_of.get(sym, ""), alloc_each)
+        result = buy(conn, sym, secid, entry.get("tsym") or sym,
+                     entry.get("bucket", ""), alloc_each)
         if result is False:                             # broker rejected the order
             notify(f"MOMENTUM: buy REJECTED - broker declined (e.g. funds unsettled). "
                    f"Skipping the remaining entries; they stay missing from the target "
@@ -304,8 +291,6 @@ def main():
         return
 
     mode = "LIVE" if live_trading else "DRY-RUN"
-    secid_of, tsym_of, bucket_of = load_universe()
-
     conn = edge.login_to_dhan()
     notify(f"MOMENTUM started [{mode}] (NSE)")
     notify(f"MOMENTUM public IP: {util.get_public_ip()}")   # must be whitelisted
@@ -315,7 +300,7 @@ def main():
     for pos in active_positions():
         if pos.get("marked_for_exit"):
             time.sleep(1)
-            sell(conn, secid_of, pos, pos.get("exit_reason") or "trailing_stop")
+            sell(conn, pos, pos.get("exit_reason") or "trailing_stop")
             sold_today.append(pos["symbol"])
 
     # 2. Sold something? Stop - Dhan settles T+1. Nothing is written down for
@@ -333,15 +318,17 @@ def main():
         summary()
         return
 
+    target = plan.get("target") or []
     held = {p["symbol"] for p in active_positions()}
-    missing = [s for s in (plan.get("target") or []) if s not in held]
+    missing = [t for t in target if t["symbol"] not in held]
+    names = [t["symbol"] for t in missing]
     available = compute_accounts()["unused_balance"]
     if missing and available > 1e-9:
-        notify(f"MOMENTUM: target={plan.get('target')} | held={sorted(held)} | "
-               f"buying {missing} with settled cash Rs{available:.0f}")
-        place_new_entries(conn, secid_of, tsym_of, bucket_of, missing, available)
+        notify(f"MOMENTUM: target={[t['symbol'] for t in target]} | held={sorted(held)} | "
+               f"buying {names} with settled cash Rs{available:.0f}")
+        place_new_entries(conn, missing, available)
     elif missing:
-        notify(f"MOMENTUM: {missing} missing from the target but cash is "
+        notify(f"MOMENTUM: {names} missing from the target but cash is "
                f"Rs{available:.0f} - nothing to buy with.")
 
     set_meta(last_momentum_date=str(today()))
