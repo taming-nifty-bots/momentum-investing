@@ -116,15 +116,6 @@ def load_universe():
 
 
 # --- ledger (accounts / meta / plan live in the positions collection by _id) --
-def default_accounts(params):
-    cap = float(params["start_capital"])
-    return {
-        "start_capital": cap, "total_balance": cap, "unused_balance": cap,
-        "invested": 0.0, "total_trades": 0, "active_trades": 0,
-        "closed_trades": 0, "winning_trades": 0, "losing_trades": 0, "total_pnl": 0.0,
-    }
-
-
 def strip(doc):
     if doc is None:
         return None
@@ -133,18 +124,48 @@ def strip(doc):
     return doc
 
 
-def get_accounts(params):
-    doc = positions.find_one({"_id": "accounts"})
-    if doc is None:
-        doc = {"_id": "accounts", **default_accounts(params)}
-        positions.insert_one(doc)
-    return strip(doc)
+def compute_accounts(params):
+    """Work the whole ledger out from the position documents themselves.
+
+    Nothing here is incremented. Every figure is derived from the positions, so
+    the ledger cannot drift away from them: if a run dies between placing an
+    order and updating a running total, the next run simply recomputes the
+    truth instead of carrying a wrong number forward for good.
+
+    The arithmetic is the same as the running totals it replaces:
+      invested       = capital still tied up in open positions
+      total_pnl      = realised P&L, i.e. the sum over closed positions
+      unused_balance = start capital, plus what we have made, minus what is
+                       currently deployed
+      total_balance  = start capital plus what we have made
+    """
+    start = float(params["start_capital"])
+    active = list(positions.find({"status": "active"}))
+    closed = list(positions.find({"status": "closed"}))
+    pnls = [float(p.get("pnl") or 0.0) for p in closed]
+
+    invested = round(sum(float(p["capital_deployed"]) for p in active), 2)
+    total_pnl = round(sum(pnls), 2)
+    return {
+        "start_capital": start,
+        "total_balance": round(start + total_pnl, 2),
+        "unused_balance": round(start + total_pnl - invested, 2),
+        "invested": invested,
+        "total_trades": len(active) + len(closed),
+        "active_trades": len(active),
+        "closed_trades": len(closed),
+        "winning_trades": sum(1 for p in pnls if p > 0),
+        "losing_trades": sum(1 for p in pnls if p < 0),
+        "total_pnl": total_pnl,
+    }
 
 
-def save_accounts(acc):
-    acc = dict(acc)
-    acc.pop("_id", None)
+def save_accounts(params):
+    """Recompute the ledger and store it. Mongo keeps a snapshot for reading;
+    the positions remain the single source of truth."""
+    acc = compute_accounts(params)
     positions.update_one({"_id": "accounts"}, {"$set": acc}, upsert=True)
+    return acc
 
 
 def get_meta():
@@ -265,23 +286,11 @@ def sell(conn, params, secid_of, pos, reason):
     pnl = round((avg - entry) * qty, 2)
     roi = round(pnl / cap * 100, 2) if cap else 0.0
 
-    acc = get_accounts(params)
-    acc["total_balance"] = round(acc["total_balance"] + pnl, 2)
-    acc["unused_balance"] = round(acc["unused_balance"] + cap + pnl, 2)
-    acc["invested"] = round(acc["invested"] - cap, 2)
-    acc["total_pnl"] = round(acc["total_pnl"] + pnl, 2)
-    acc["active_trades"] = acc.get("active_trades", 0) - 1
-    acc["closed_trades"] = acc.get("closed_trades", 0) + 1
-    if pnl > 0:
-        acc["winning_trades"] = acc.get("winning_trades", 0) + 1
-    elif pnl < 0:
-        acc["losing_trades"] = acc.get("losing_trades", 0) + 1
-    save_accounts(acc)
-
     positions.update_one(
         {"symbol": sym, "status": "active"},
         {"$set": {"status": "closed", "exit_price": avg, "exit_date": str(today()),
                   "pnl": pnl, "roi": roi, "exit_reason": reason}})
+    save_accounts(params)       # derived from the positions, so recompute AFTER the write
     notify(f"MOMENTUM: SOLD {sym} x{qty} @ {avg:.2f} ({reason}) pnl=Rs{pnl:.0f} roi={roi:.1f}%")
     return round(avg * qty, 2)
 
@@ -304,13 +313,6 @@ def buy(conn, params, sym, secid, tsym, bucket, alloc):
     avg = float(order["averageTradedPrice"])
     spend = round(avg * qty, 2)
 
-    acc = get_accounts(params)
-    acc["unused_balance"] = round(acc["unused_balance"] - spend, 2)
-    acc["invested"] = round(acc["invested"] + spend, 2)
-    acc["total_trades"] = acc.get("total_trades", 0) + 1
-    acc["active_trades"] = acc.get("active_trades", 0) + 1
-    save_accounts(acc)
-
     positions.insert_one({
         "symbol": sym, "secid": secid, "tsym": tsym, "bucket": bucket,
         "entry_price": avg, "quantity": qty, "capital_deployed": spend,
@@ -319,6 +321,7 @@ def buy(conn, params, sym, secid, tsym, bucket, alloc):
         "ltp": avg, "last_close": avg, "shadow_pnl": 0.0,
         "exit_price": "", "exit_date": "", "pnl": "", "roi": 0.0,
     })
+    save_accounts(params)       # derived from the positions, so recompute AFTER the write
     notify(f"MOMENTUM: BOUGHT {sym} x{qty} @ {avg:.2f} (Rs{spend:.0f})")
     return True
 
@@ -382,7 +385,7 @@ def deploy_pending_buys(conn, params, secid_of, tsym_of, bucket_of):
 
 
 def summary(params):
-    acc = get_accounts(params)
+    acc = save_accounts(params)
     holdings = [p["symbol"] for p in active_positions()]
     equity = round(acc["unused_balance"] + acc["invested"], 2)
     notify("MOMENTUM summary | holdings={h} | cash=Rs{c:.0f} | invested=Rs{i:.0f} | "
@@ -461,7 +464,7 @@ def main():
     #        or a month that only redeploys idle cash), so BUY the new entries now.
     if rebalancing:
         new_entries = list(plan["new_entries"])
-        available = get_accounts(params)["unused_balance"]
+        available = compute_accounts(params)["unused_balance"]
         if not new_entries or available <= 1e-9:
             notify(f"MOMENTUM: no new entries to place (new={new_entries}, cash=Rs{available:.0f}).")
         elif sold_today:
