@@ -108,8 +108,7 @@ def load_universe():
         notify("MOMENTUM ABORT: etf_universe is empty - seed etf_universe in Mongo first.")
         raise SystemExit(1)
     # secid is the NSE exchange token, which is also Dhan's securityId for cash
-    # equity - the same number that was already stored for Definedge, so nothing
-    # in etf_universe had to change for the broker move.
+    # equity.
     secid_of = {d["symbol"]: d["secid"] for d in docs}
     tsym_of = {d["symbol"]: d["tsym"] for d in docs}
     bucket_of = {d["symbol"]: d["bucket"] for d in docs}
@@ -250,7 +249,7 @@ def why_failed(order):
 def sell(conn, params, secid_of, pos, reason):
     """Market-sell a full position, realize P&L and update the ledger."""
     sym, qty = pos["symbol"], pos["quantity"]
-    tsym = pos.get("tsym") or f"{sym}-{params.get('series', 'EQ')}"
+    tsym = pos.get("tsym") or sym
     secid = pos.get("secid") or secid_of.get(sym)
     if not secid:
         notify(f"MOMENTUM: SELL SKIPPED {sym} - no secid on the position or in etf_universe.")
@@ -289,12 +288,11 @@ def sell(conn, params, secid_of, pos, reason):
 
 def buy(conn, params, sym, secid, tsym, bucket, alloc):
     """Market-buy `alloc` rupees of `sym`, floored to whole units, and record it."""
-    cost = float(params["cost_per_side"])
     price = ltp(conn, secid)
     if not price or price <= 0:
         notify(f"MOMENTUM: no price for {sym}; skipping buy")
         return None                                     # local skip (not a broker rejection)
-    qty = int(alloc * (1 - cost) / price)              # whole ETF units only
+    qty = int(alloc / price)                            # whole ETF units only
     if qty <= 0:                                        # skip if the slice buys 0 units
         notify(f"MOMENTUM: alloc Rs{alloc:.0f} buys 0 units of {sym}; skipping")
         return None                                     # local skip (not a broker rejection)
@@ -340,7 +338,7 @@ def place_new_entries(conn, params, secid_of, tsym_of, bucket_of, new_entries, a
         if not secid:
             notify(f"MOMENTUM: {sym} is not in etf_universe (no secid); skipping")
             continue
-        tsym = tsym_of.get(sym, f"{sym}-{params.get('series', 'EQ')}")
+        tsym = tsym_of.get(sym, sym)
         result = buy(conn, params, sym, secid, tsym, bucket_of.get(sym, ""), alloc_each)
         if result is False:                             # broker rejected the order
             notify(f"MOMENTUM: buy REJECTED for {label} - broker declined "
@@ -401,11 +399,10 @@ def main():
 
     mode = "LIVE" if LIVE else "DRY-RUN"
     params = load_params()
-    exchange = params["exchange"]
     secid_of, tsym_of, bucket_of = load_universe()
 
     conn = edge.login_to_dhan()
-    notify(f"MOMENTUM started [{mode}] ({exchange})")
+    notify(f"MOMENTUM started [{mode}] (NSE)")
     # Dhan only accepts orders from a whitelisted static IP, so print the address
     # this container actually goes out on - it is the first thing to check when
     # orders start getting refused.

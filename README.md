@@ -49,9 +49,11 @@ decisions are made on completed candles and fills happen at the next open:
   completed daily candles. Analysis only, never places an order.
   Updates each holding's trailing peak and flags stop breaches, ranks the 27
   ETFs, and writes a provisional monthly-rebalance plan to Mongo.
-  *(It ran after the close under Definedge. Dhan publishes a session's daily
-  candle too late for that - on 2026-09-25 the day's bar still did not exist at
-  22:57 - so it moved to the following morning. Same completed candles either
+  *(It must not act on a session before that session's daily bar is published;
+  the morning slot is early enough to be safe. How soon after the close Dhan
+  actually publishes has not been measured — the only observation is that the
+  2026-09-25 bar was absent at 22:57 and present by 12:03 the next day, a
+  13-hour bracket that proves nothing narrower. Same completed candles either
   way, so the decisions are unchanged.)*
 - **`momentum/`** - runs **at/just after the open**. The only job that trades.
   Sells stop-flagged holdings, **deploys any new entries deferred from the
@@ -102,7 +104,7 @@ Shared, read by both jobs (seeded once; already populated in prod):
 | Collection | `_id` | Contents |
 |------------|-------|----------|
 | `etf_universe` | symbol | `{symbol, tsym, secid, bucket, name, is_park}` - 27 ETFs + `LIQUIDCASE` |
-| `etf_params` | `params` | `lookback, n_hold, top_retain, stop_pct, rebalance, sizing, refill_on_stop, momentum_min, exchange, series, product_type, order_type, cost_per_side, start_capital` |
+| `etf_params` | `params` | `lookback, n_hold, top_retain, stop_pct, momentum_min, start_capital` |
 
 Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 
@@ -173,12 +175,16 @@ the plan and the stop flags that `signal` writes.
   + clears them the next session; the funds-unsettled path (broker rejects the
   day-2 buy) correctly **alerts on Slack, skips, and drops** the pending buys. The
   port reproduces the engine's rebalance decisions except for a handful of
-  marginal whole-unit / cost-buffer buys over 3 years (benign, +2.25% on the
-  ledger). T+1 costs ~3 CAGR points vs same-day (engine 55.9% vs 58.9%).
-- **Symbols** verified against the Definedge public master: all 27 ETFs + park
-  resolve as `<SYMBOL>-EQ` with token == secid (28/28 OK). Re-verified against
-  Dhan's NSE cash scrip master on 2026-09-25 for the broker move: all 28 stored
-  `secid` values match Dhan's `SECURITY_ID` exactly (0 mismatch, 0 missing), so
-  the universe needed no change.
+  marginal whole-unit buys over 3 years (benign, +2.25% on the ledger). T+1 costs
+  ~3 CAGR points vs same-day (engine 55.9% vs 58.9%).
+  *(That replay ran with a 5 bps sizing buffer that has since been removed, so
+  whole-unit rounding is now the only source of divergence. Removing the buffer
+  can only raise a buy by `alloc x 0.0005 / price` units — under 1 unit for any
+  ETF above ~Rs50 at a ~Rs1L slice — so the conclusion stands, but the +2.25%
+  figure itself has not been re-measured.)*
+- **Symbols**: all 28 stored `secid` values are NSE exchange tokens, verified
+  against Dhan's NSE cash scrip master on 2026-09-25 — every one matches Dhan's
+  `SECURITY_ID` exactly (0 mismatch, 0 missing), so the universe needed no
+  change for the broker move.
 - **Not** yet validated: live broker fills, slippage, real-world execution - those
   only come from the dry-run forward test.

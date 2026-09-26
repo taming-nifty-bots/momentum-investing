@@ -14,10 +14,13 @@ Universe + parameters are read from MongoDB (etf_universe, etf_params).
 Like the other strategies: one self-contained file, tamingnifty for the broker
 and Slack, MongoDB as the ledger.
 
-SCHEDULING: everything here is driven by DAILY candles, and Dhan publishes a
-session's consolidated daily candle very late - on 2026-09-25 that day's bar
-still did not exist at 22:57. So this job has to run the MORNING AFTER the
-session it is acting on (before the momentum job), not the same evening.
+SCHEDULING: everything here is driven by DAILY candles, so this job must not act
+on a session until that session's daily bar has been published. It runs the
+MORNING AFTER the session it is acting on (before the momentum job), which is
+early enough to be safe regardless of how soon after the close Dhan publishes.
+How soon that actually is has NOT been measured - the one observation we have is
+that the 2026-09-25 bar was absent at 22:57 that night and present by 12:03 the
+next day, which brackets it to a 13-hour window and proves nothing narrower.
 """
 import os
 import time
@@ -185,7 +188,7 @@ def load_universe():
         notify("SIGNAL ABORT: etf_universe is empty - seed etf_universe in Mongo first.")
         raise SystemExit(1)
     # secid is the NSE exchange token, which is also Dhan's securityId for cash
-    # equity - the same number that was already stored for Definedge.
+    # equity.
     secid_of = {d["symbol"]: d["secid"] for d in docs}
     tsym_of = {d["symbol"]: d["tsym"] for d in docs}
     bucket_of = {d["symbol"]: d["bucket"] for d in docs}
@@ -199,7 +202,6 @@ def main():
         return
 
     params = load_params()
-    exchange = params["exchange"]
     lookback = int(params["lookback"])
     n_hold = int(params["n_hold"])
     top_retain = int(params["top_retain"])
@@ -208,7 +210,7 @@ def main():
     candidates, secid_of, tsym_of, bucket_of = load_universe()
 
     conn = edge.login_to_dhan()
-    notify(f"SIGNAL started ({exchange}, {len(candidates)} ETFs, lookback={lookback}, stop={stop_pct*100:.0f}%)")
+    notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={lookback}, stop={stop_pct*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
     # 1. trailing-stop maintenance on active holdings
