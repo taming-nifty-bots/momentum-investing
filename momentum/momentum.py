@@ -69,10 +69,6 @@ def month_key():
     return f"{d.year:04d}-{d.month:02d}"
 
 
-def is_trading_day():
-    return today().weekday() < 5      # Mon-Fri only (live)
-
-
 # --- ledger -------------------------------------------------------------------
 # Positions and the accounts / meta / plan singletons live in separate
 # collections: the ledger is DERIVED from find({"status": "active"}), so a stray
@@ -297,10 +293,8 @@ def summary():
 
 
 def main():
-    if not is_trading_day():
-        notify("MOMENTUM: not a trading day - nothing to do.")
-        return
-
+    # No calendar check here. Which days this job runs is decided by the Azure
+    # cron schedule, so weekends and market holidays are handled there.
     mode = "LIVE" if live_trading else "DRY-RUN"
     conn = edge.login_to_dhan()
     notify(f"MOMENTUM started [{mode}] (NSE)")

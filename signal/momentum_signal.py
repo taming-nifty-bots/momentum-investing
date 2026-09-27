@@ -71,10 +71,6 @@ def today():
     return datetime.now().date()
 
 
-def is_trading_day():
-    return today().weekday() < 5      # Mon-Fri only (live)
-
-
 def parse_date(s):
     return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
 
@@ -245,10 +241,8 @@ def load_universe():
 
 
 def main():
-    if not is_trading_day():
-        notify("SIGNAL: not a trading day - nothing to do.")
-        return
-
+    # No calendar check here. Which days this job runs is decided by the Azure
+    # cron schedule, so weekends and market holidays are handled there.
     candidates, secid_of, tsym_of, bucket_of = load_universe()
 
     conn = edge.login_to_dhan()

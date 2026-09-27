@@ -320,9 +320,25 @@ docker run --rm --env-file momentum/.env etf-momentum
 ```
 
 In production these are cron-scheduled Azure Container App Jobs (see the CI/CD
-workflow): `signal` early in the morning, `momentum` shortly after the open,
-Mon-Fri. `signal` **must** finish before `momentum` starts - `momentum` acts on
+workflow): `signal` early in the morning, `momentum` shortly after the open.
+`signal` **must** finish before `momentum` starts - `momentum` acts on
 the target and the exit flags that `signal` writes, and decides nothing itself.
+
+**Neither job checks the calendar.** There is no weekday test and no holiday
+list in the code: if the job is started, it runs. Which days that happens on is
+entirely the cron schedule's business. That is deliberate - it means a session
+can be replayed on a weekend for testing, it means the market holiday list
+lives in one place (the schedule) instead of being duplicated in two jobs that
+would then have to be redeployed every time the exchange publishes a new one,
+and it means the **Budget special sessions NSE holds at a weekend**
+(`2025-02-01` Sat, `2026-02-01` Sun - real, price-continuous cash-segment days)
+can be traded by simply scheduling them. The old `weekday() < 5` test could not:
+2025-02-01 was the first trading session of February and it would have pushed
+that rebalance to the Monday.
+
+The cost is that a job fired on a holiday will still run: `signal` re-decides on
+the last published candle and `momentum` would act on it. Do not schedule one on
+a day the market is shut.
 
 ## Safety
 
