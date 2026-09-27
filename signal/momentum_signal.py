@@ -47,7 +47,8 @@ TOP_RETAIN = 7         # keep a holding while its rank is <= this
 STOP_PCT = 0.08        # trailing stop, below the peak daily close
 MOMENTUM_MIN = 0.0     # eligibility: momentum must be STRICTLY above this
 
-# The freshness guard asks this one liquid name which session is the newest.
+# One liquid name, asked every run which session is the newest. It is a record
+# of what the job decided on, not a gate on whether it runs.
 CALENDAR_REF = "NIFTYBEES"
 
 
@@ -247,8 +248,12 @@ def main():
     notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={LOOKBACK}, stop={STOP_PCT*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
-    # 1. Freshness guard, on a SINGLE candle: if the newest bar Dhan has is the
-    #    one the last run already acted on, there is nothing new to decide.
+    # 1. Which session are we deciding on? One candle from a reference ETF tells
+    #    us, and that date is what gets stamped on the plan and on meta.
+    #    This is a RECORD, not a gate: if Dhan has not published today's bar yet
+    #    the job still runs, on the previous session's close. Whether that is
+    #    acceptable is decided by when the job is scheduled, which is manual.
+    #    The Slack line below is what you read to judge Dhan's publishing lag.
     ref = CALENDAR_REF if CALENDAR_REF in secid_of else candidates[0]
     series_of = {}
     fetch_into(conn, series_of, [(ref, secid_of[ref])])
@@ -260,10 +265,8 @@ def main():
         raise SystemExit(1)
     last_done = get_meta().get("last_candle_date")
     notify(f"SIGNAL: newest daily candle = {signal_date} (via {ref}), seen at "
-           f"{datetime.now():%H:%M:%S} | last processed = {last_done or 'never'}")
-    if str(signal_date) == str(last_done):
-        notify("SIGNAL: no new candle since the last run - nothing to do.")
-        return
+           f"{datetime.now():%H:%M:%S} | last processed = {last_done or 'never'}"
+           + ("  <- SAME as last run" if str(signal_date) == str(last_done) else ""))
 
     # 2. Trailing stops - EVERY day. A stop can break on any session.
     active = list(positions.find({"status": "active"}))

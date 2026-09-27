@@ -86,18 +86,24 @@ the moment it writes the plan.
   Rotations and stops carry the **same flag** on purpose. To `momentum` an exit
   is an exit; `exit_reason` is a label for the ledger, not something it acts on.
 
-  *(It must not act on a session before that session's daily bar is published.
-  Rather than trust the cron slot for that, the job asks **one** liquid name -
-  `NIFTYBEES`, the `CALENDAR_REF` constant - for the newest daily bar and
-  compares it with the `last_candle_date` it stored last run; if they match
-  there is nothing new to decide and it stops, one Dhan call in. Which session
-  is "now" is a property of the market, not of what we happen to hold, so this
-  works with zero holdings and on a month with no rebalance due. It also makes
-  the job safe to re-run by hand, and logs the candle date next to the wall
-  clock every run - so the Slack history measures Dhan's real publish lag for
-  free. How soon after the close Dhan publishes has not been measured; the only
-  observation is that the 2026-09-25 bar was absent at 22:57 and present by
-  12:03 the next day, a 13-hour bracket that proves nothing narrower.)*
+  *(Every run asks **one** liquid name - `NIFTYBEES`, the `CALENDAR_REF`
+  constant - for the newest daily bar, and stamps that date on the plan and on
+  `meta.last_candle_date`. It is a **record, not a gate**: the job does not stop
+  when the bar is unchanged since the last run, it just says so in Slack next to
+  the wall clock. Deciding whether today's bar is published yet is done by
+  choosing the cron slot, by hand. Which session is "now" is a property of the
+  market, not of what we happen to hold, so this works with zero holdings and on
+  a month with no rebalance due. How soon after the close Dhan publishes has not
+  been measured; the only observation is that the 2026-09-25 bar was absent at
+  22:57 and present by 12:03 the next day, a 13-hour bracket that proves nothing
+  narrower - which is why the log line is there.*
+
+  *Re-running the job by hand is still harmless, but that is the doing of
+  `last_rebalanced_month`, not of the candle date: a second run on the same month
+  redoes the stop maintenance, which is idempotent, and skips the ranking
+  entirely. The risk the candle date no longer covers is running on a day when
+  Dhan has not published yet - then a rebalance ranks on the previous session's
+  close.)*
 - **`momentum/`** - runs **at/just after the open**. The only job that trades,
   and it is deliberately trivial: sell everything flagged, and if nothing sold,
   buy whatever the target says is missing. It holds no month logic, no ranking,
