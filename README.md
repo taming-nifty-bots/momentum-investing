@@ -170,8 +170,25 @@ Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 | Collection | Docs |
 |------------|------|
 | `etf_positions_<user>` | one doc per position, and **nothing else** |
-| `etf_state_<user>` | the three control singletons - `_id:accounts` (the ledger), `_id:meta` (`last_candle_date`, `last_rebalanced_month`, both written by `signal`), `_id:plan` (the rebalance plan; its `target` is the book `momentum` reconciles towards - a list of `{symbol, secid, tsym, bucket}` - and the rest is there to be read by a human) |
+| `etf_state_<user>` | the three control singletons - `_id:accounts` (the ledger), `_id:meta` (`last_candle_date`, `last_rebalanced_month`, both written by `signal`), `_id:plan` (four fields, see below) |
 | `etf_orders_<user>` | one doc per placed/simulated order |
+
+`_id:plan` is deliberately four fields and nothing more:
+
+| Field | What it is |
+|-------|-----------|
+| `for_month` | the month this rebalance is for, e.g. `2026-10` |
+| `signal_date` | the daily candle it was decided on |
+| `target` | the book `momentum` reconciles towards - `{symbol, secid, tsym, bucket}` per name |
+| `ranking` | every eligible ETF that session: `{symbol, rank, momentum}` |
+
+`target` is the only field `momentum` reads. What was retained, what rotated out
+and what got stopped is **not** stored here, because the position documents
+already record it (`entry_date`, `status`, `exit_reason`) - a copy in the plan
+would only go stale the moment a mid-month stop edits `target`. `ranking` stays
+because it is the one thing the positions cannot tell you after the fact: why
+these four names and not the others. Same reasoning as `_id:accounts` being
+derived rather than kept by hand.
 
 The control docs used to share the positions collection, which worked only because
 they had no `status` field and so fell out of `find({"status": "active"})`. That is

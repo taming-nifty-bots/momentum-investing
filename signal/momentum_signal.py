@@ -343,29 +343,24 @@ def main():
                              {"$set": {"marked_for_exit": True,
                                        "exit_reason": "rebalance"}})
 
-    # target = the book we want to end up holding. It carries everything the
-    # momentum job needs to place the order, so that job never has to read
-    # etf_universe - a new entry has no position document to look it up on, and
-    # this is the moment we already have it resolved. Everything else in the plan
-    # is there to be read by a human in Mongo or Slack.
+    # target = the book we want to end up holding, and the ONLY field momentum
+    # reads. Each entry carries everything needed to place the order, so that job
+    # never has to read etf_universe - a new entry has no position document to
+    # look it up on, and this is the moment we already have it resolved.
     target = [{"symbol": sym, "secid": secid_of[sym], "tsym": tsym_of[sym],
                "bucket": bucket_of[sym]} for sym in retained + new_entries]
+
+    # The plan is four fields and nothing else. What was retained, what rotated
+    # out and what got stopped is already recorded on the position documents
+    # themselves (entry_date / status / exit_reason), so copying it here would
+    # only be a second version of it that goes stale the moment a stop fires.
+    # ranking is the one thing positions cannot tell you afterwards, so it stays.
     plan = {
-        "signal_date": str(signal_date),
-        "generated_on": str(today()),
         "for_month": current_month,
+        "signal_date": str(signal_date),      # the candle this was decided on
         "target": target,
-        "retained": retained,
-        "new_entries": new_entries,
-        "rotated_out": rotations,
-        "held_before": [p["symbol"] for p in active],
-        "stop_exits": stopped_now,
-        "ranked_top": ranked[:10],
-        "rank_of": {s: rank_of[s] for s in ranked[:12]},
-        "mom_of": {s: round(mom_of[s], 4) for s in ranked[:12]},
-        "n_hold": N_HOLD,
-        "top_retain": TOP_RETAIN,
-        "lookback": LOOKBACK,
+        "ranking": [{"symbol": s, "rank": i + 1, "momentum": round(mom_of[s], 4)}
+                    for i, s in enumerate(ranked)],
     }
     state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
 
@@ -374,9 +369,12 @@ def main():
     set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()),
              last_rebalanced_month=current_month)
 
+    # Slack still gets the full story of the rebalance, because that is what a
+    # notification is for; the plan doc does not have to carry a copy of it.
     notify("SIGNAL done. signal_date={sd} | month={m} | held={hb} | stops={st} | "
            "retain={rt} | rotate={ro} | new={nw} | target={tg}".format(
-               sd=plan["signal_date"], m=current_month, hb=plan["held_before"],
+               sd=signal_date, m=current_month,
+               hb=[p["symbol"] for p in active],
                st=stopped_now, rt=retained, ro=rotations, nw=new_entries,
                tg=[t["symbol"] for t in target]))
     if ranked:
