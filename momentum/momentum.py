@@ -11,6 +11,11 @@ the signal job left in Mongo and acts on them:
   1. Sell every holding flagged marked_for_exit.
   2. Sold anything? STOP - Dhan settles T+1, so that cash is not usable today.
   3. Otherwise buy whatever of the target we are not already holding.
+  4. Once nothing is missing, stamp meta.last_rebalanced_month. That is the one
+     field this job WRITES for the other one: a rebalance is "done" when the
+     money moved, not when it was decided, and only this job knows that. Once
+     stamped, no new entry goes on the book until the next month - so a stop
+     that sells mid-month leaves the cash idle, which is the validated rule.
 
 See README.md for the design - why the target is a state rather than a shopping
 list, and how that makes T+1 and every retry fall out for free.
@@ -56,6 +61,12 @@ def notify(message):
 
 def today():
     return datetime.now().date()
+
+
+def month_key():
+    # Same format signal uses, so the two jobs compare the same string.
+    d = today()
+    return f"{d.year:04d}-{d.month:02d}"
 
 
 def is_trading_day():
@@ -318,10 +329,24 @@ def main():
         summary()
         return
 
+    this_month = month_key()
     target = plan.get("target") or []
     held = {p["symbol"] for p in active_positions()}
     missing = [t for t in target if t["symbol"] not in held]
     names = [t["symbol"] for t in missing]
+
+    # This month's entries are already placed, so nothing new goes on the book
+    # until the next rebalance. If a name is missing from the target now, a stop
+    # sold it mid-month - and the validated rule is that the freed cash sits idle
+    # until the next rebalance rather than refilling the slot.
+    if get_meta().get("last_rebalanced_month") == this_month:
+        if missing:
+            notify(f"MOMENTUM: {names} missing from the target, but {this_month} "
+                   f"entries are already done - no mid-month refill.")
+        set_meta(last_momentum_date=str(today()))
+        summary()
+        return
+
     available = compute_accounts()["unused_balance"]
     if missing and available > 1e-9:
         notify(f"MOMENTUM: target={[t['symbol'] for t in target]} | held={sorted(held)} | "
@@ -330,6 +355,26 @@ def main():
     elif missing:
         notify(f"MOMENTUM: {names} missing from the target but cash is "
                f"Rs{available:.0f} - nothing to buy with.")
+
+    # 4. Stamping the month is THIS job's call, because this job is the one that
+    #    knows whether the money actually moved. signal only decided it.
+    #    Two conditions, and both matter:
+    #      - the plan must be for THIS month, or we would be marking a month
+    #        rebalanced that signal has not even ranked for;
+    #      - nothing may still be missing, so a rejected buy leaves the month
+    #        open and the next session retries it instead of skipping it.
+    still_missing = [t["symbol"] for t in target
+                     if t["symbol"] not in {p["symbol"] for p in active_positions()}]
+    if plan.get("for_month") != this_month:
+        notify(f"MOMENTUM: the plan is for {plan.get('for_month')}, not {this_month} - "
+               f"not stamping the month; signal has not ranked for it yet.")
+    elif still_missing:
+        notify(f"MOMENTUM: {this_month} rebalance NOT complete - {still_missing} still "
+               f"missing, so the month stays open and the next session tries again.")
+    else:
+        set_meta(last_rebalanced_month=this_month)
+        notify(f"MOMENTUM: {this_month} rebalance executed - holding "
+               f"{[t['symbol'] for t in target]}. No new entries until next month.")
 
     set_meta(last_momentum_date=str(today()))
     summary()

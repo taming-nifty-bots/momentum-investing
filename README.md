@@ -52,13 +52,22 @@ month boundary, rebalance**. Live, that is split into two scheduled jobs so
 decisions are made on completed candles and fills happen at the next open.
 
 The split is not an even one, and deliberately so: **`signal` decides everything,
-`momentum` decides nothing.** They never call each other - they meet at exactly
-two fields in Mongo:
+`momentum` decides nothing** - except the one thing only it can know, whether the
+money actually moved. They never call each other - they meet at exactly three
+fields in Mongo, and one of them flows the other way:
 
 | Field | Written by | Read by |
 |-------|-----------|---------|
 | `marked_for_exit` on a position | `signal` | `momentum` sells it, whatever the reason |
 | `plan.target` | `signal` | `momentum` buys whatever of it is missing |
+| `meta.last_rebalanced_month` | **`momentum`** | `signal` stops re-deciding the month |
+
+That last row is the one to keep in mind: **a month counts as rebalanced when the
+money moved, not when it was decided**, and only `momentum` is in a position to
+say so. Until it stamps the month, `signal` re-decides the rebalance on the
+freshest candles every session - which is exactly what makes a ranking computed
+on a stale candle, or a morning the broker rejected every buy, self-correcting
+rather than lost.
 
 Each target entry carries everything needed to place the order -
 `{symbol, secid, tsym, bucket}` - so `momentum` never reads `etf_universe` at
@@ -67,21 +76,23 @@ document to look it up on, and `signal` has already resolved all three fields at
 the moment it writes the plan.
 
 - **`signal/`** - runs **early, before the open**, on the previous session's
-  completed daily candles. Analysis only, never places an order. It does two
-  things, on **two different clocks**:
+  completed daily candles. Analysis only, never places an order. It does three
+  things, and only the third is monthly:
   - **every session** - update each holding's trailing peak and flag stop
     breaches (`marked_for_exit`, `exit_reason: trailing_stop`), and remove the
     stopped name from the target. A stop can break on any session, so this is
-    unconditional. It needs candles for the holdings only (at most 4).
-  - **only when a rebalance is due** (`month_key()` differs from the
-    `last_rebalanced_month` it stamps itself) - rank the full universe, flag the
+    unconditional.
+  - **every session** - rank the full universe and post it to Slack. The rank
+    only *drives* a decision at a rebalance, but a ranking you cannot see is a
+    ranking you cannot sanity-check, so the ~28 rate-limited Dhan calls a day are
+    accepted deliberately. Computing it changes nothing on a non-rebalance
+    session; it is written to `plan.ranking` only when a plan is written.
+  - **only while this month's rebalance is still open** (`month_key()` differs
+    from the `last_rebalanced_month` that **`momentum`** stamped) - flag the
     holdings that fell out of the retain band (`marked_for_exit`,
-    `exit_reason: rebalance`), write the **target** book, and stamp the month.
-    The rank is read at exactly one moment, that rebalance; on the other ~20
-    sessions of a month computing it would cost 28 rate-limited Dhan calls to
-    produce a number nothing consumes. Skipping it changes **no** decision the
-    strategy makes - the only visible difference is that the daily Slack ranking
-    post now appears on rebalance days only.
+    `exit_reason: rebalance`) and write the **target** book. Once `momentum`
+    reports the buying is done, the target is left alone for the rest of the
+    month.
 
   Rotations and stops carry the **same flag** on purpose. To `momentum` an exit
   is an exit; `exit_reason` is a label for the ledger, not something it acts on.
@@ -98,16 +109,27 @@ the moment it writes the plan.
   22:57 and present by 12:03 the next day, a 13-hour bracket that proves nothing
   narrower - which is why the log line is there.*
 
-  *Re-running the job by hand is still harmless, but that is the doing of
-  `last_rebalanced_month`, not of the candle date: a second run on the same month
-  redoes the stop maintenance, which is idempotent, and skips the ranking
-  entirely. The risk the candle date no longer covers is running on a day when
-  Dhan has not published yet - then a rebalance ranks on the previous session's
-  close.)*
-- **`momentum/`** - runs **at/just after the open**. The only job that trades,
-  and it is deliberately trivial: sell everything flagged, and if nothing sold,
-  buy whatever the target says is missing. It holds no month logic, no ranking,
-  and no notion of what a "rebalance" is. See *Settlement* below.
+  *Re-running the job by hand is harmless, but note what that now rests on. On a
+  month `momentum` has already executed, the rebalance gate stops it. On a month
+  still open, a re-run **re-decides** the target - identical candles give an
+  identical plan, so it is idempotent in practice, but a fresher candle will
+  legitimately change it. That is the trade: the rebalance is no longer frozen
+  the instant it is first decided, in exchange for being retried until it is
+  actually paid for.)*
+- **`momentum/`** - runs **at/just after the open**. The only job that trades:
+  sell everything flagged, and if nothing sold, buy whatever the target says is
+  missing. It ranks nothing and chooses nothing. The single decision it does make
+  is the one above - whether this month's buying is complete - and it takes two
+  conditions, both of which matter:
+  - the stored plan must be for **this** month, or it would mark a month
+    rebalanced that `signal` has never ranked for, silently skipping it;
+  - **nothing** may still be missing from the target, so a rejected buy leaves
+    the month open and the next session retries instead of skipping it.
+
+  Once stamped, `momentum` refuses new entries until the next month. That is a
+  second lock on the no-refill rule (`signal` dropping the stopped name from the
+  target is the first), and it is what keeps cash freed by a mid-month stop idle
+  until the next rebalance. See *Settlement* below.
 
 Each folder is a standalone job (own `Dockerfile` + `requirements.txt` + `.env`),
 exactly like the other strategies.
@@ -144,6 +166,15 @@ So a rebalance that sells splits naturally across two sessions:
   from the target are bought with the now-settled cash. This matches the
   `entry_lag=1` backtest.
 
+**The target is not frozen between those two days.** `momentum` has not stamped
+the month yet (nothing was bought on day 1), so day 2's `signal` run re-decides
+the rebalance on day 2's candle - and if the ranking has moved, the names bought
+may differ from the ones day 1 sold for. This is a real, accepted consequence of
+letting `momentum` own the month: the alternative was freezing the plan the
+instant it was decided, which also froze a plan decided on a stale candle or a
+morning every order was rejected. Retrying until the money actually moves was
+judged worth one day of drift at the seam.
+
 Two cases fall out of that ordering rather than needing their own code:
 
 - **A rebalance that sells nothing** (the very first run, or a month whose
@@ -176,7 +207,7 @@ Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 | Collection | Docs |
 |------------|------|
 | `etf_positions_<user>` | one doc per position, and **nothing else** |
-| `etf_state_<user>` | the three control singletons - `_id:accounts` (the ledger), `_id:meta` (`last_candle_date`, `last_rebalanced_month`, both written by `signal`), `_id:plan` (four fields, see below) |
+| `etf_state_<user>` | the three control singletons - `_id:accounts` (the ledger), `_id:meta` (`last_candle_date` written by `signal`, `last_rebalanced_month` written by **`momentum`**), `_id:plan` (four fields, see below) |
 | `etf_orders_<user>` | one doc per placed/simulated order |
 
 `_id:plan` is deliberately four fields and nothing more:
@@ -214,15 +245,22 @@ comments so the jobs stay short enough to read in one screen.
 gets most calls refused with `DH-904`; measured 2026-09-25, **17 of 27 failed at
 no sleep and 0 failed at 0.25s**. `PAUSE_BETWEEN_CALLS = 0.5` in
 `momentum_signal.py` waits before every candle request - at half a second the
-whole universe still finishes in under 20 seconds. This is the reason the
-ranking is monthly rather than daily: an ordinary session costs ~4 calls
-(reference + holdings) instead of ~29.
+whole universe still finishes in under 20 seconds. That budget is what makes a
+**daily** ranking affordable: ~29 calls every session, ~20 seconds, deliberately
+paid so the order book is visible every day rather than once a month.
+
+**A partial universe only aborts the job when a plan was going to be written.**
+If Dhan answers for fewer than 80% of the candidates, `signal` refuses to write a
+rebalance plan from it and exits 1 - a half-empty universe would rank the wrong
+names to the top. On a month that is already executed there is no plan to write,
+so a rate-limited session logs the warning and finishes normally rather than
+exiting non-zero every day.
 
 **`signal` fetches in stages and never fetches the same name twice** - the
-calendar reference first, then the holdings, then (only on a rebalance) the rest
-of the universe, each stage skipping what an earlier one already pulled. A
-holding that has dropped out of `etf_universe` carries its own `secid` on the
-position document, so its stop keeps being maintained.
+calendar reference first, then the holdings, then the rest of the universe, each
+stage skipping what an earlier one already pulled. A holding that has dropped out
+of `etf_universe` carries its own `secid` on the position document, so its stop
+keeps being maintained.
 
 **`secid` is the NSE exchange token, which is also Dhan's `securityId`** for cash
 equity - the universe needed no change for the broker move. Dhan keys orders and
@@ -252,12 +290,12 @@ because it is data, and it is edited far more often.
 ```
 momentum-investing/
 |-- signal/
-|   |-- momentum_signal.py   # ALL decisions: stops daily, ranking + rotations + target monthly. No orders.
+|   |-- momentum_signal.py   # ALL decisions: stops + ranking daily, rotations + target while the month is open. No orders.
 |   |-- requirements.txt     # all deps (incl. tamingnifty==2.1.0)
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)
 |-- momentum/
-|   |-- momentum.py          # NO decisions: sell what is flagged, buy what the target lacks (DRY-RUN unless live_trading=true)
+|   |-- momentum.py          # sell what is flagged, buy what the target lacks, close the month (DRY-RUN unless live_trading=true)
 |   |-- requirements.txt
 |   |-- Dockerfile
 |   `-- .env                 # secrets (gitignored)
@@ -303,6 +341,11 @@ the target and the exit flags that `signal` writes, and decides nothing itself.
   trailing-stop math in `signal/momentum_signal.py` matches the reference engine
   across 144,000 randomized checks (0 mismatches), and the earlier offline test
   matched `bt_v2.py` on 37/37 monthly rebalances and every stop breach date.
+  **Re-proved 2026-09-27 after the ranking went daily and the month moved to
+  `momentum`**: a 750-session replay over the live 27-ETF universe still gives
+  37/37 identical rankings, 37/37 identical selections and 750/750 identical stop
+  sessions - **0 mismatches**. Neither change touches what the strategy decides;
+  they change *when* it is computed and *who* records that it was paid for.
 - **T+1 settlement (exit-d1 / enter-d2)** is validated end-to-end: a 3-year
   day-by-day replay drives the **real** `signal` + `momentum` modules (over a fake
   Mongo + mock broker) and compares to the `entry_lag=1` backtest. Every rebalance
@@ -310,9 +353,10 @@ the target and the exit flags that `signal` writes, and decides nothing itself.
   and places them the next session. *(That replay predates the 2026-09-26 rework, which moved every decision into
   `signal` and left `momentum` reconciling holdings against `plan.target`; the
   same day-1/day-2 split is now produced by the sell-then-stop ordering instead,
-  and is covered by a 26-check branch test on `momentum`, plus a 22-check test
-  that `signal` really does make every decision - including that a stop removes
-  its name from the target, which is the no-refill rule.)* The
+  and is covered by a 27-check branch test on `momentum`, a 26-check test that
+  `signal` really does make every decision - including that a stop removes its
+  name from the target, which is the no-refill rule - and a 27-check test that
+  `momentum` closes the month only once the buying has actually completed.)* The
   port reproduces the engine's rebalance decisions except for a handful of
   marginal whole-unit buys over 3 years (benign, +2.25% on the ledger). T+1 costs
   ~3 CAGR points vs same-day (engine 55.9% vs 58.9%).

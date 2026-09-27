@@ -2,18 +2,25 @@
 ETF Momentum Rotation - SIGNAL job (runs once a day, before the open).
 
 Every decision the strategy makes is made here; the momentum job places the
-orders and decides nothing. They never call each other - they meet at two fields
-in Mongo: marked_for_exit (this job sets it, momentum sells it) and plan.target
-(this job writes it, momentum buys whatever is missing).
+orders and decides nothing. They never call each other - they meet at three
+fields in Mongo, and only one of them flows back this way:
+
+    marked_for_exit         this job sets it, momentum sells it
+    plan.target             this job writes it, momentum buys whatever is missing
+    last_rebalanced_month   MOMENTUM writes it, this job reads it - a month is
+                            rebalanced when the money moved, not when it was
+                            decided, and only momentum knows that
 
   1. Trailing stops - EVERY session.
-  2. Ranking, rotations and the target - ONLY when a rebalance is due.
+  2. Ranking - EVERY session, so the order book is visible daily.
+  3. Rotations and the target - only while this month's rebalance is still open,
+     i.e. until momentum reports it executed.
 
 Parameters are constants below; the universe is read from etf_universe in Mongo.
 
-See README.md for the design - why the two steps run on different clocks, why
-rotations and stops share one flag, and why the target is a state rather than an
-instruction.
+See README.md for the design - why rotations and stops share one flag, why the
+target is a state rather than an instruction, and why the month is stamped by
+the job that trades rather than the job that decides.
 """
 import os
 import time
@@ -300,17 +307,9 @@ def main():
                    f"({(last/peak-1)*100:.1f}% from peak) -> sell at next open")
         positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields})
 
-    # 3. Ranking - ONLY when a rebalance is due. The rank is read at exactly one
-    #    moment, so computing it daily would cost 28 calls for nothing.
+    # 3. Ranking - EVERY session. The rank only drives a decision at a rebalance,
+    #    but it is worth seeing daily, so the ~28 Dhan calls are accepted.
     current_month = month_key()
-    if current_month == get_meta().get("last_rebalanced_month"):
-        set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()))
-        notify(f"SIGNAL done. signal_date={signal_date} | held={[p['symbol'] for p in active]} "
-               f"| stops={stopped_now} | {current_month} already rebalanced - ranking skipped "
-               f"({len(series_of)} of {len(candidates)} candles fetched).")
-        return
-
-    notify(f"SIGNAL: rebalance due for {current_month} - ranking the full universe.")
     fetch_into(conn, series_of, [(s, secid_of[s]) for s in candidates])
 
     closes_by_symbol = {}
@@ -319,17 +318,36 @@ def main():
         if closes:
             closes_by_symbol[sym] = closes
 
-    # Never plan off a universe that rate limiting has eaten half of.
     if len(closes_by_symbol) < len(candidates):
         missing = [s for s in candidates if s not in closes_by_symbol]
         notify(f"SIGNAL: WARNING - no candles for {len(missing)} candidate(s): {missing}")
+
+    ranked, rank_of, mom_of = rank_universe(closes_by_symbol, LOOKBACK, MOMENTUM_MIN)
+    if ranked:
+        notify("SIGNAL ranking (top): " + ", ".join(
+            f"{s}#{rank_of[s]}({mom_of[s]*100:.1f}%)" for s in ranked[:6]))
+
+    # 4. Rebalance - rotations and a new target - only while this month's one is
+    #    still OPEN. momentum closes it by stamping last_rebalanced_month once
+    #    the buying has actually happened, so a month counts as rebalanced when
+    #    the money moved, not when it was decided. Until then every run re-decides
+    #    it on the freshest candles available, which is what makes a run on a
+    #    stale candle, or a day the broker rejected everything, self-correcting.
+    if current_month == get_meta().get("last_rebalanced_month"):
+        set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()))
+        notify(f"SIGNAL done. signal_date={signal_date} | held={[p['symbol'] for p in active]} "
+               f"| stops={stopped_now} | ranked {len(ranked)} eligible | {current_month} "
+               f"already executed by momentum - no rotations, target left alone.")
+        return
+
+    # About to write a plan, so now a half-empty universe actually matters.
     if len(closes_by_symbol) < len(candidates) * 0.8:
         notify(f"SIGNAL ABORT: only {len(closes_by_symbol)} of {len(candidates)} candidates "
                f"returned candles - refusing to write a rebalance plan from a partial "
                f"universe. Re-run once Dhan is answering.")
         raise SystemExit(1)
 
-    ranked, rank_of, mom_of = rank_universe(closes_by_symbol, LOOKBACK, MOMENTUM_MIN)
+    notify(f"SIGNAL: {current_month} rebalance still open - deciding it now.")
 
     # Stops sell at the open, before the rebalance is evaluated (engine order).
     held_after_stops = [p["symbol"] for p in active if p["symbol"] not in stopped_now]
@@ -367,10 +385,10 @@ def main():
     }
     state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
 
-    # This job decided the rebalance, so this job records that it is decided.
-    # last_candle_date is the CANDLE it was decided on, not the day we ran.
-    set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()),
-             last_rebalanced_month=current_month)
+    # NOT last_rebalanced_month - that one is momentum's to write, because only
+    # momentum knows whether the orders went through.
+    # last_candle_date is the CANDLE this was decided on, not the day we ran.
+    set_meta(last_candle_date=str(signal_date), last_signal_date=str(today()))
 
     # Slack still gets the full story of the rebalance, because that is what a
     # notification is for; the plan doc does not have to carry a copy of it.
@@ -380,9 +398,6 @@ def main():
                hb=[p["symbol"] for p in active],
                st=stopped_now, rt=retained, ro=rotations, nw=new_entries,
                tg=[t["symbol"] for t in target]))
-    if ranked:
-        notify("SIGNAL ranking (top): " + ", ".join(
-            f"{s}#{rank_of[s]}({mom_of[s]*100:.1f}%)" for s in ranked[:6]))
 
 
 if __name__ == "__main__":
