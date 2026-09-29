@@ -24,6 +24,7 @@ the job that trades rather than the job that decides.
 """
 import os
 import time
+import traceback
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -60,11 +61,12 @@ CALENDAR_REF = "NIFTYBEES"
 
 
 def notify(message):
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+    # No print here. util.notify prints the same line itself, with a timestamp and the
+    # channel name, before it posts - keeping a second print would double every log line.
     try:
         util.notify(message=str(message), slack_channel=slack_channel, slack_client=slack_client)
     except Exception as exc:
-        print(f"[notify] slack post failed: {exc}", flush=True)
+        print(f"[notify] slack post failed, message was '{message}': {util.exception_detail(exc)}", flush=True)
 
 
 def today():
@@ -395,4 +397,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Without this the job dies with a traceback on stdout and says NOTHING in
+        # Slack. On 2026-09-29 the signal crashed on a Dhan HTTP 400 and the only
+        # reason anyone found out was that it happened to be run by hand; in Azure
+        # the container would simply have exited and nobody would have known the
+        # month's signal was never written.
+        #
+        # SystemExit is a BaseException, not an Exception, so the deliberate
+        # `raise SystemExit(1)` aborts elsewhere in this file still pass straight
+        # through here untouched and stay quiet.
+        traceback.print_exc()
+        notify(f"SIGNAL CRASHED: {util.exception_detail(e)}")
+        raise

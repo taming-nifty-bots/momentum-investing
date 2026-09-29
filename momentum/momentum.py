@@ -24,6 +24,7 @@ SAFETY: orders are DRY RUN unless live_trading=true.
 """
 import os
 import time
+import traceback
 from datetime import datetime
 
 from pymongo import MongoClient
@@ -52,11 +53,12 @@ START_CAPITAL = 400000.0
 
 
 def notify(message):
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+    # No print here. util.notify prints the same line itself, with a timestamp and the
+    # channel name, before it posts - keeping a second print would double every log line.
     try:
         util.notify(message=str(message), slack_channel=slack_channel, slack_client=slack_client)
     except Exception as exc:
-        print(f"[notify] slack post failed: {exc}", flush=True)
+        print(f"[notify] slack post failed, message was '{message}': {util.exception_detail(exc)}", flush=True)
 
 
 def today():
@@ -151,8 +153,12 @@ def ltp(conn, secid):
         price = edge.get_equity_ltp(conn, secid)
         if price:
             return float(price)
-    except Exception:
-        pass
+    except Exception as exc:
+        # The daily-close fallback below is the right behaviour, but swallowing this
+        # silently meant a broken LTP feed looked identical to a healthy one that
+        # simply had no quote - and the price used for sizing was quietly stale.
+        print(f"[ltp] live quote for {secid} unavailable, falling back to the last "
+              f"daily close: {util.exception_detail(exc)}", flush=True)
     return last_daily_close(conn, secid)
 
 
@@ -183,7 +189,10 @@ def place_market(conn, secid, tsym, side, qty):
     except Exception as exc:
         # A rejection is an expected outcome (unsettled funds), and Dhan raises it
         # as an HTTP error - hand the caller a dict instead of killing the job.
-        return {"orderStatus": "REJECTED", "message": str(exc)}
+        # exception_detail rather than str(exc) because str() on a requests HTTPError
+        # is "400 Client Error:  for url: ..." and drops Dhan's actual reason, which
+        # then gets written to the order log and Slack as the explanation.
+        return {"orderStatus": "REJECTED", "message": util.exception_detail(exc)}
     return edge.wait_for_fill(conn, order["orderId"])
 
 
@@ -375,4 +384,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Without this the job dies with a traceback on stdout and says NOTHING in
+        # Slack. This one places real orders, so a silent crash can leave the book
+        # half-rebalanced - some legs sent, the rest never attempted - and the only
+        # clue would be the next session's "rebalance NOT complete" line.
+        #
+        # SystemExit is a BaseException, not an Exception, so the deliberate
+        # `raise SystemExit(1)` aborts elsewhere in this file still pass straight
+        # through here untouched and stay quiet.
+        traceback.print_exc()
+        notify(f"MOMENTUM CRASHED: {util.exception_detail(e)}")
+        raise
