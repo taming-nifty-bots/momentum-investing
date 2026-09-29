@@ -305,7 +305,7 @@ def main():
     # No calendar check here. Which days this job runs is decided by the Azure
     # cron schedule, so weekends and market holidays are handled there.
     mode = "LIVE" if live_trading else "DRY-RUN"
-    conn = edge.login_to_dhan()
+    conn = edge.login_to_dhan(slack_channel=slack_channel)
     notify(f"MOMENTUM started [{mode}] (NSE)")
     notify(f"MOMENTUM public IP: {util.get_public_ip()}")   # must be whitelisted
 

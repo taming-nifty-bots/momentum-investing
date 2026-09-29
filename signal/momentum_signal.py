@@ -247,7 +247,7 @@ def main():
     # cron schedule, so weekends and market holidays are handled there.
     candidates, secid_of, tsym_of, bucket_of = load_universe()
 
-    conn = edge.login_to_dhan()
+    conn = edge.login_to_dhan(slack_channel=slack_channel)
     notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={LOOKBACK}, stop={STOP_PCT*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 

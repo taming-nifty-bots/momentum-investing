@@ -291,7 +291,7 @@ because it is data, and it is edited far more often.
 momentum-investing/
 |-- signal/
 |   |-- momentum_signal.py   # ALL decisions: stops + ranking daily, rotations + target while the month is open. No orders.
-|   |-- requirements.txt     # all deps (incl. tamingnifty==2.1.1)
+|   |-- requirements.txt     # all deps (incl. tamingnifty==2.2.0)
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)
 |-- momentum/
