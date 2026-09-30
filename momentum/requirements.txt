@@ -7,4 +7,4 @@ Requests==2.31.0
 retry==0.9.2
 slack_sdk==3.27.1
 python-dotenv==1.0.1
-tamingnifty==2.3.0
+tamingnifty==2.3.1
