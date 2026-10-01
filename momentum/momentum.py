@@ -14,8 +14,16 @@ the signal job left in Mongo and acts on them:
   4. Once nothing is missing, stamp meta.last_rebalanced_month. That is the one
      field this job WRITES for the other one: a rebalance is "done" when the
      money moved, not when it was decided, and only this job knows that. Once
-     stamped, no new entry goes on the book until the next month - so a stop
-     that sells mid-month leaves the cash idle, which is the validated rule.
+     stamped, no new RISK name goes on the book until the next month - that is
+     the no-mid-month-refill rule, and a stop that sells mid-month still never
+     gets its slot refilled by another ETF.
+  5. The one thing that DOES get bought in a stamped month is the liquid park,
+     flagged is_park on its own target entry. A park entry is not "buy one of
+     these" - it says spare settled cash belongs here, which is a property of a
+     cash-equivalent rather than a decision. So spare cash is swept into it, and
+     a park position we already hold is topped up instead of duplicated. This is
+     not the refill-on-stop the backtest rejected: that one raised equity
+     exposure, this one keeps the cash cushion and simply stops it earning zero.
 
 See README.md for the design - why the target is a state rather than a shopping
 list, and how that makes T+1 and every retry fall out for free.
@@ -50,6 +58,7 @@ orders = db[f"etf_orders_{user_name}"]
 
 # The signal job owns the ranking/stop parameters; this job owns only the money.
 START_CAPITAL = 400000.0
+MIN_PARK_SWEEP = 1000.0    # rupees; below this, spare cash waits for the rebalance
 
 
 def notify(message):
@@ -251,6 +260,29 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
     avg = float(order["averageTradedPrice"])
     spend = round(avg * qty, 2)
 
+    open_pos = positions.find_one({"symbol": sym, "status": "active"})
+    if open_pos:
+        # Only the park reaches this branch: every other buy comes from `missing`,
+        # which is by definition a name we do not hold. Add to the position we
+        # already have rather than inserting a second document for the same
+        # symbol - sell() and signal's peak update both do
+        # update_one({"symbol": sym, "status": "active"}), which would touch
+        # exactly one of two and leave the ledger claiming units already sold.
+        # Weighted-average cost, and entry_date/peak stay at the ORIGINAL entry:
+        # signal recomputes the peak from scratch over the closes since
+        # entry_date every session, so the trailing stop keeps measuring from
+        # where the position really began.
+        total_qty = open_pos["quantity"] + qty
+        total_cap = round(float(open_pos["capital_deployed"]) + spend, 2)
+        positions.update_one(
+            {"symbol": sym, "status": "active"},
+            {"$set": {"quantity": total_qty, "capital_deployed": total_cap,
+                      "entry_price": round(total_cap / total_qty, 4)}})
+        save_accounts()         # derived from the positions, so recompute AFTER the write
+        notify(f"MOMENTUM: ADDED {sym} x{qty} @ {avg:.2f} (Rs{spend:.0f}) - now "
+               f"x{total_qty}, avg cost {total_cap / total_qty:.2f}")
+        return True
+
     positions.insert_one({
         "symbol": sym, "secid": secid, "tsym": tsym, "bucket": bucket,
         "entry_price": avg, "quantity": qty, "capital_deployed": spend,
@@ -288,6 +320,29 @@ def place_new_entries(conn, new_entries, available):
                    f"so the next session tries again.")
             return False
     return True
+
+
+def sweep_into_park(conn, park):
+    """Put spare settled cash into the liquid park.
+
+    A park entry in the target is not "buy one of these" - it says spare cash
+    belongs here, which is a property of a cash-equivalent, not a decision. So
+    this runs on every session of a closed month and is idempotent: no spare
+    cash, nothing happens. It tops up a park position we already hold, which is
+    what makes two stops on two different days both end up in one place.
+    """
+    secid = park.get("secid")
+    if not secid:
+        notify(f"MOMENTUM: no secid on the park entry for {park['symbol']}; skipping")
+        return
+    available = compute_accounts()["unused_balance"]
+    if available < MIN_PARK_SWEEP:
+        # Below the floor it is not worth a Slack line a day for the rest of the
+        # month; the crumbs are picked up by the next rebalance.
+        return
+    notify(f"MOMENTUM: parking spare cash Rs{available:.0f} in {park['symbol']}")
+    buy(conn, park["symbol"], secid, park.get("tsym") or park["symbol"],
+        park.get("bucket", ""), available)
 
 
 def summary():
@@ -338,14 +393,19 @@ def main():
     missing = [t for t in target if t["symbol"] not in held]
     names = [t["symbol"] for t in missing]
 
-    # This month's entries are already placed, so nothing new goes on the book
-    # until the next rebalance. If a name is missing from the target now, a stop
-    # sold it mid-month - and the validated rule is that the freed cash sits idle
-    # until the next rebalance rather than refilling the slot.
+    # This month's entries are already placed, so no new RISK name goes on the
+    # book until the next rebalance. If one is missing from the target now, a
+    # stop sold it mid-month - and the validated rule is that its slot is not
+    # refilled with another ETF. The park is the exception: it is a cash
+    # equivalent, so spare cash is swept into it rather than earning nothing.
     if get_meta().get("last_rebalanced_month") == this_month:
-        if missing:
-            notify(f"MOMENTUM: {names} missing from the target, but {this_month} "
+        blocked = [t["symbol"] for t in missing if not t.get("is_park")]
+        if blocked:
+            notify(f"MOMENTUM: {blocked} missing from the target, but {this_month} "
                    f"entries are already done - no mid-month refill.")
+        park = next((t for t in target if t.get("is_park")), None)
+        if park:
+            sweep_into_park(conn, park)
         set_meta(last_momentum_date=str(today()))
         summary()
         return

@@ -1,7 +1,7 @@
 # ETF Momentum Rotation - Live (Dhan)
 
 A live-deployable port of the validated **"Final" ETF Momentum Rotation strategy**
-(backtest config `21 / 4 / 7`, trailing 8% stop, no mid-month refill). Same stack
+(backtest config `21 / 4 / 7`, trailing 8% stop, no mid-month ETF refill). Same stack
 as the author's other live strategies: **Dhan via the
 `tamingnifty` package** with **MongoDB** as the ledger, split into two small,
 self-contained, scheduled container jobs.
@@ -23,17 +23,66 @@ universe stays in Mongo - that is data, not a rule.
 
 | Rule | Value |
 |------|-------|
-| Universe | 27 curated, liquidity-screened NSE ETFs (+ one liquid-cash park) |
+| Universe | 27 curated, liquidity-screened NSE ETFs **+ one liquid-cash park** (`LIQUIDCASE`), ranked alongside them |
 | Momentum | close-to-close return over **21 trading days** (candles, not calendar) |
 | Eligibility | momentum **strictly > 0**, else not rankable (no SMA regime gate) |
 | Holdings | **4**, equal-weight of *freed cash* on entry |
 | Retention band | keep a holding while its rank <= **7** (`top_retain`) |
-| Bucket cap | at most **one** holding per asset-class bucket |
+| Bucket cap | at most **one** holding per asset-class bucket (the park's `Liquid` bucket has one member, so it can never take more than one slot) |
 | Rebalance | **monthly**, first trading session of each month |
 | Settlement | **T+1** - if anything sold today, the job stops; the buys land the next session on settled cash |
 | Exit (daily) | **trailing stop 8%** below the peak *daily close* (ratchets up only) |
 | Fills | every signal is identified on the **close**, filled at the **next open** |
-| Mid-month refill | **NONE** - cash freed by a stop waits for the next rebalance |
+| Mid-month refill | **NO risk ETF ever refills a stopped slot.** The freed cash is swept into the liquid park instead of sitting idle - see *The liquid park* below |
+
+### The liquid park (`LIQUIDCASE`)
+
+The universe carries one cash-equivalent ETF flagged `is_park` in `etf_universe`.
+Until 2026-10-01 both jobs filtered it out, so it was a document nothing read.
+It now does two things:
+
+1. **It is ranked like any other name** and keeps a slot if it earns one. In a
+   weak tape fewer than 4 ETFs clear the `momentum > 0` bar, and the target was
+   written *short* - `place_new_entries` splits the freed cash across whatever is
+   missing, so **one** eligible name took the whole slice.
+
+   Measured over the live 27 risk names, first session of each month,
+   2022-01-03 → 2026-09-01 (**57 months**):
+
+   | Bar | Months with fewer than 4 names above it |
+   |---|---|
+   | `momentum > 0` (the live eligibility rule - *the target is written short*) | **7 of 57 (12%)** |
+   | the park's own momentum, on its real bars since 2024-01-24 | **2 of 31 (6%)** |
+   | the park's median 0.4679%/21d, applied to all 57 as a proxy | **9 of 57 (16%)** - 2022: 6/12, 2023: 1/12, 2024: 0/12, 2025: 1/12, 2026: 1/9 |
+
+   It is regime-dependent, not rare: 2022 bound in half its months and 2024 in
+   none. The worst case is real - **2026-04-01 had exactly one eligible ETF**
+   (`MON100`), so under today's code one name takes 100% of the freed cash.
+   Capping that at a 1/4 slice is the same concentration limit the bucket cap
+   already enforces.
+2. **A stop puts it in the stopped name's place in the target**, so the freed
+   cash is parked rather than earning nothing until the next rebalance.
+
+> **This is not the refill-on-stop the backtest rejected.** That test refilled
+> the slot with the next-best **equity** ETF: +0.6pp CAGR but MDD −16.0% →
+> −22.5%, and average cash 11.3% → **0%** - fundamentally an *exposure
+> increase*. Parking **keeps** that cash cushion; only its yield changes. The
+> validated engine always credited idle cash 6%/yr (`liq_yield`) and the live
+> port credited 0% precisely because both jobs filtered the park out - measured
+> at `entry_lag=1`, **55.80% vs 54.77% CAGR**. So this closes a known
+> engine-vs-port gap rather than opening a new bet.
+
+The park is a **growth** ETF, not an accrual one: 100.22 (2024-01-24) → 116.10
+(2026-09-25), **5.67% CAGR**, 4 down days out of 662, and a 21-day momentum that
+is **never negative in 642 windows** (median 0.4679%, range 0.3378%–0.6143%). So
+it is eligible every single session and ranks last in any decent tape. That
+growth matters - had it been `LIQUIDBEES` (fixed Rs1000 NAV, accrual paid out as
+units) its price would be flat, it would never clear `momentum > 0`, and the
+whole feature would silently do nothing.
+
+Nothing else is special-cased. The 8% trailing stop stays armed on it, it
+rotates out above rank 7 like anything else, and `place_new_entries` funds it
+equal-weight like anything else.
 
 ### Built-in concentration risk (intended, faithful behaviour)
 
@@ -43,7 +92,9 @@ proceeds + idle cash). Retained winners are **never topped up or trimmed**
 the book, and when it leaves ~0 free cash the rebalance buys nothing new. This
 concentration partly *drove* the backtest's high CAGR and is a real single-name
 risk - the live jobs keep the cash gate exactly, because that IS the validated
-strategy. Manage it with **capital size**, not code.
+strategy. Manage it with **capital size**, not code. The park caps the *other*
+concentration case - a thin month handing one ETF the whole slice - but does
+nothing about this one, which is a property of the cash gate itself.
 
 ## Architecture: two jobs
 
@@ -70,21 +121,27 @@ on a stale candle, or a morning the broker rejected every buy, self-correcting
 rather than lost.
 
 Each target entry carries everything needed to place the order -
-`{symbol, secid, tsym, bucket}` - so `momentum` never reads `etf_universe` at
-all. It has to come from `signal`: a name we do not hold yet has no position
-document to look it up on, and `signal` has already resolved all three fields at
-the moment it writes the plan.
+`{symbol, secid, tsym, bucket, is_park}` - so `momentum` never reads
+`etf_universe` at all. It has to come from `signal`: a name we do not hold yet
+has no position document to look it up on, and `signal` has already resolved
+every field at the moment it writes the plan. `is_park` is on the entry for the
+same reason: it is how `momentum` tells a cash-equivalent from a risk ETF
+without reading the universe or hardcoding a symbol, so changing which name is
+the park is a Mongo edit and not a code change.
 
 - **`signal/`** - runs **early, before the open**, on the previous session's
   completed daily candles. Analysis only, never places an order. It does three
   things, and only the third is monthly:
   - **every session** - update each holding's trailing peak and flag stop
-    breaches (`marked_for_exit`, `exit_reason: trailing_stop`), and remove the
-    stopped name from the target. A stop can break on any session, so this is
+    breaches (`marked_for_exit`, `exit_reason: trailing_stop`), and **swap the
+    stopped name out of the target for the park** (`swap_for_park`). The stopped
+    name never comes back and nothing else takes its slot; appending the park is
+    a no-op when it is already there, so however many names stop in a month there
+    is still exactly one park entry. A stop can break on any session, so this is
     unconditional.
   - **every session** - rank the full universe and post it to Slack. The rank
     only *drives* a decision at a rebalance, but a ranking you cannot see is a
-    ranking you cannot sanity-check, so the ~28 rate-limited Dhan calls a day are
+    ranking you cannot sanity-check, so the ~29 rate-limited Dhan calls a day are
     accepted deliberately. Computing it changes nothing on a non-rebalance
     session; it is written to `plan.ranking` only when a plan is written.
   - **only while this month's rebalance is still open** (`month_key()` differs
@@ -126,10 +183,23 @@ the moment it writes the plan.
   - **nothing** may still be missing from the target, so a rejected buy leaves
     the month open and the next session retries instead of skipping it.
 
-  Once stamped, `momentum` refuses new entries until the next month. That is a
-  second lock on the no-refill rule (`signal` dropping the stopped name from the
-  target is the first), and it is what keeps cash freed by a mid-month stop idle
-  until the next rebalance. See *Settlement* below.
+  Once stamped, `momentum` refuses new **risk** entries until the next month.
+  That is a second lock on the no-refill rule (`signal` taking the stopped name
+  out of the target is the first), and it is what stops a stopped slot being
+  refilled by another ETF. The one entry it will still place is the park, because
+  a park entry in the target is not "buy one of these" - it says *spare settled
+  cash belongs here*, which is a property of a cash-equivalent rather than a
+  decision. So `sweep_into_park` runs on **every** session of a closed month, not
+  just the one after a stop, and is idempotent: no spare cash, nothing happens.
+  `MIN_PARK_SWEEP = 1000.0` keeps flooring crumbs from posting a Slack line every
+  day for the rest of the month. See *Settlement* below.
+
+  Two stops on two different days therefore end up in **one** position.
+  `buy()` adds to an open position of the same symbol rather than inserting a
+  second document, at weighted-average cost, leaving `entry_date` at the original
+  entry so `signal` keeps recomputing the trailing peak from where the position
+  really began. Only the park can reach that branch - every other buy comes from
+  `missing`, which is by definition a name we do not hold.
 
 Each folder is a standalone job (own `Dockerfile` + `requirements.txt` + `.env`),
 exactly like the other strategies.
@@ -179,10 +249,13 @@ Two cases fall out of that ordering rather than needing their own code:
 
 - **A rebalance that sells nothing** (the very first run, or a month whose
   holdings were all retained) skips step 2 and buys the **same day**.
-- **A mid-month trailing stop** sells and stops, and buys nothing back - because
-  `signal` removed the stopped name from the target when it flagged it. That one
-  line *is* the no-refill-on-stop rule; leave it out and the next session would
-  buy the name straight back.
+- **A mid-month trailing stop** sells and stops, and **no ETF is bought back** -
+  because `signal` took the stopped name out of the target when it flagged it.
+  That one line *is* the no-refill-on-stop rule; leave it out and the next
+  session would buy the name straight back. The next session does buy the
+  **park** with the freed cash, which needs no new timing code: step 2 already
+  returns on *any* sell day, so the session that sells cannot also sweep, and the
+  one after it can.
 
 Deferring (only when something was sold) costs roughly **~1.8 CAGR points** vs a
 hypothetical fully same-day rotation - the freed sale cash sits idle one extra day
@@ -216,7 +289,7 @@ Per-user ledger (`<user>` = `user_name` env; created lazily by `momentum`):
 |-------|-----------|
 | `for_month` | the month this rebalance is for, e.g. `2026-10` |
 | `signal_date` | the daily candle it was decided on |
-| `target` | the book `momentum` reconciles towards - `{symbol, secid, tsym, bucket}` per name |
+| `target` | the book `momentum` reconciles towards - `{symbol, secid, tsym, bucket, is_park}` per name |
 | `ranking` | every eligible ETF that session: `{symbol, rank, momentum}` |
 
 `target` is the only field `momentum` reads. What was retained, what rotated out
@@ -241,13 +314,14 @@ Read it, don't write it.
 Small operational facts that the code assumes. They live here rather than as
 comments so the jobs stay short enough to read in one screen.
 
-**Dhan rate-limits the data API.** Walking all 28 ETFs back to back with no pause
-gets most calls refused with `DH-904`; measured 2026-09-25, **17 of 27 failed at
-no sleep and 0 failed at 0.25s**. `PAUSE_BETWEEN_CALLS = 0.5` in
+**Dhan rate-limits the data API.** Walking the whole universe back to back with
+no pause gets most calls refused with `DH-904`; measured 2026-09-25, **17 of 27
+failed at no sleep and 0 failed at 0.25s**. `PAUSE_BETWEEN_CALLS = 0.5` in
 `momentum_signal.py` waits before every candle request - at half a second the
 whole universe still finishes in under 20 seconds. That budget is what makes a
-**daily** ranking affordable: ~29 calls every session, ~20 seconds, deliberately
-paid so the order book is visible every day rather than once a month.
+**daily** ranking affordable: one call per name, ~29 a session since the park was
+let in, ~20 seconds, deliberately paid so the order book is visible every day
+rather than once a month.
 
 **A partial universe only aborts the job when a plan was going to be written.**
 If Dhan answers for fewer than 80% of the candidates, `signal` refuses to write a
@@ -291,7 +365,7 @@ because it is data, and it is edited far more often.
 momentum-investing/
 |-- signal/
 |   |-- momentum_signal.py   # ALL decisions: stops + ranking daily, rotations + target while the month is open. No orders.
-|   |-- requirements.txt     # all deps (incl. tamingnifty==2.2.0)
+|   |-- requirements.txt     # all deps (incl. tamingnifty==2.3.1)
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)
 |-- momentum/
@@ -369,10 +443,11 @@ a day the market is shut.
   and places them the next session. *(That replay predates the 2026-09-26 rework, which moved every decision into
   `signal` and left `momentum` reconciling holdings against `plan.target`; the
   same day-1/day-2 split is now produced by the sell-then-stop ordering instead,
-  and is covered by a 27-check branch test on `momentum`, a 26-check test that
-  `signal` really does make every decision - including that a stop removes its
-  name from the target, which is the no-refill rule - and a 27-check test that
-  `momentum` closes the month only once the buying has actually completed.)* The
+  and is covered by a 27-check branch test on `momentum`, a 45-check test that
+  `signal` really does make every decision - including that a stop swaps its name
+  out of the target for the park, which is the mid-month rule - and a 50-check
+  test that `momentum` closes the month only once the buying has actually
+  completed.)* The
   port reproduces the engine's rebalance decisions except for a handful of
   marginal whole-unit buys over 3 years (benign, +2.25% on the ledger). T+1 costs
   ~3 CAGR points vs same-day (engine 55.9% vs 58.9%).
@@ -387,3 +462,15 @@ a day the market is shut.
   change for the broker move.
 - **Not** yet validated: live broker fills, slippage, real-world execution - those
   only come from the dry-run forward test.
+- **The liquid park (2026-10-01)** has **no backtest of its own.** It was
+  implemented directly, on three grounds: the strategy runs `live_trading=false`
+  with zero forward-test credit so nothing real is at risk; Part 1's binding
+  frequency is measured above (7 of 57 months written short); and Part 2's
+  economics are already quantified by the engine's own `liq_yield` (55.80% vs
+  54.77% CAGR at `entry_lag=1`). A real-price run could not have reached the
+ documented
+  37-rebalance baseline anyway - `LIQUIDCASE` has no price bars before
+  **2024-01-24**. What *is* proved is that the math did not move: `parity_check`
+  drives the four pure functions with its own candidate list and still returns
+  **0 mismatches**, so the change altered which names are fed into the ranking,
+  not the ranking itself.

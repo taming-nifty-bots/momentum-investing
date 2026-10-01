@@ -16,6 +16,10 @@ fields in Mongo, and only one of them flows back this way:
   3. Rotations and the target - only while this month's rebalance is still open,
      i.e. until momentum reports it executed.
 
+The liquid park (is_park in etf_universe) is ranked like any other name and can
+win a slot on its own momentum; and when a stop fires it takes the stopped name's
+place in the target, so the freed cash is parked rather than left idle.
+
 Parameters are constants below; the universe is read from etf_universe in Mongo.
 
 See README.md for the design - why rotations and stops share one flag, why the
@@ -215,21 +219,46 @@ def set_meta(**fields):
     state.update_one({"_id": "meta"}, {"$set": fields}, upsert=True)
 
 
-def drop_from_target(sym):
-    """Take a stopped name out of the plan's target.
+def swap_for_park(sym, park):
+    """Take a stopped name out of the plan's target, and put the liquid park in.
 
-    Momentum buys whatever the target says is missing, so removing the name here
-    IS the no-mid-month-refill rule. See README.md.
+    Momentum buys whatever the target says is missing, so what the target holds
+    after a stop IS the mid-month rule. Two halves:
+      - the stopped name goes out and never comes back. That is unchanged, and
+        it is the refill-on-stop rule the backtest rejected (refilling the slot
+        with the next-best EQUITY ETF raised exposure and worsened drawdown).
+      - the park goes in, so the cash sits in a cash-equivalent instead of
+        earning nothing. The engine always credited idle cash a yield; the live
+        jobs never did, because both of them filtered the park out.
+
+    Appending is a no-op when the park is already in the target, so however many
+    names stop this month there is still exactly one park entry. See README.md.
     """
     plan = state.find_one({"_id": "plan"})
     if not plan:
         return
     target = [t for t in (plan.get("target") or []) if t["symbol"] != sym]
+    if park and sym != park["symbol"] and not any(t["symbol"] == park["symbol"]
+                                                  for t in target):
+        # If the park itself were ever stopped, putting it straight back would
+        # have momentum buying a name that is flagged for exit - hence the
+        # sym != park check.
+        target.append(park)
     state.update_one({"_id": "plan"}, {"$set": {"target": target}})
 
 
+def fat_entry(sym, secid_of, tsym_of, bucket_of, park_of):
+    """One target entry: everything momentum needs to place the order.
+
+    is_park is what lets momentum tell a cash-equivalent from a risk ETF without
+    reading etf_universe or knowing any symbol by name.
+    """
+    return {"symbol": sym, "secid": secid_of[sym], "tsym": tsym_of[sym],
+            "bucket": bucket_of[sym], "is_park": park_of[sym]}
+
+
 def load_universe():
-    docs = list(universe_coll.find({"is_park": {"$ne": True}}))
+    docs = list(universe_coll.find({}))
     if not docs:
         notify("SIGNAL ABORT: etf_universe is empty - seed etf_universe in Mongo first.")
         raise SystemExit(1)
@@ -238,17 +267,24 @@ def load_universe():
     secid_of = {d["symbol"]: d["secid"] for d in docs}
     tsym_of = {d["symbol"]: d["tsym"] for d in docs}
     bucket_of = {d["symbol"]: d["bucket"] for d in docs}
+    # The park is no longer filtered out here - it ranks like any other name and
+    # keeps a slot if it earns one. Its bucket has a single member, so the
+    # one-per-bucket rule in select_rebalance caps it at one slot by itself.
+    park_of = {d["symbol"]: bool(d.get("is_park")) for d in docs}
     candidates = [d["symbol"] for d in docs]
-    return candidates, secid_of, tsym_of, bucket_of
+    return candidates, secid_of, tsym_of, bucket_of, park_of
 
 
 def main():
     # No calendar check here. Which days this job runs is decided by the Azure
     # cron schedule, so weekends and market holidays are handled there.
-    candidates, secid_of, tsym_of, bucket_of = load_universe()
+    candidates, secid_of, tsym_of, bucket_of, park_of = load_universe()
+    park_sym = next((s for s in candidates if park_of[s]), None)
+    park = fat_entry(park_sym, secid_of, tsym_of, bucket_of, park_of) if park_sym else None
 
     conn = edge.login_to_dhan(slack_channel=slack_channel)
-    notify(f"SIGNAL started (NSE, {len(candidates)} ETFs, lookback={LOOKBACK}, stop={STOP_PCT*100:.0f}%)")
+    notify(f"SIGNAL started (NSE, {len(candidates)} names, park={park_sym}, "
+           f"lookback={LOOKBACK}, stop={STOP_PCT*100:.0f}%)")
     notify(f"SIGNAL public IP: {util.get_public_ip()}")
 
     # 1. Which session are we deciding on? One candle from a reference ETF tells
@@ -298,7 +334,7 @@ def main():
             fields["marked_for_exit"] = True
             fields["exit_reason"] = "trailing_stop"
             stopped_now.append(sym)
-            drop_from_target(sym)                 # no refill: see drop_from_target
+            swap_for_park(sym, park)              # no refill, but park the cash
             notify(f"SIGNAL: STOP flagged {sym} close={last:.2f} peak={peak:.2f} "
                    f"({(last/peak-1)*100:.1f}% from peak) -> sell at next open")
         positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields})
@@ -364,8 +400,8 @@ def main():
     # reads. Each entry carries everything needed to place the order, so that job
     # never has to read etf_universe - a new entry has no position document to
     # look it up on, and this is the moment we already have it resolved.
-    target = [{"symbol": sym, "secid": secid_of[sym], "tsym": tsym_of[sym],
-               "bucket": bucket_of[sym]} for sym in retained + new_entries]
+    target = [fat_entry(sym, secid_of, tsym_of, bucket_of, park_of)
+              for sym in retained + new_entries]
 
     # The plan is four fields and nothing else. What was retained, what rotated
     # out and what got stopped is already recorded on the position documents
