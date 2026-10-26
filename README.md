@@ -192,6 +192,42 @@ redeploys) are **not** delayed.
 
 ## MongoDB schema (`Bots` database)
 
+### Charge accounting (local update, 2026-10-26)
+
+The momentum job requires `tamingnifty==2.3.2`; publish that library version and
+rebuild the job before deploying this change. The signal job is unchanged.
+
+Position documents add only `charges` and `net_pnl`; `pnl` and `roi` remain
+gross. While active, `charges` contains incurred entry charges and `net_pnl` is
+null. On close, `charges` becomes the complete entry/exit breakdown and
+`net_pnl = pnl - charges.total`. Top-ups accumulate actual entry-order fees
+without creating duplicate positions. Gross sale P&L uses proceeds minus the
+stored deployed capital, avoiding rounding drift from the displayed weighted
+entry price.
+
+The accounts cache keeps gross `total_pnl`, adds realized `net_pnl` and itemized
+incurred `charges`, and uses net results for win/loss counts. Its balance and
+available cash deduct **closed round-trip costs plus active entry costs exactly
+once**. Buy quantities reserve estimated entry fees within each quoted budget;
+actual market fills can still move after sizing. Rankings, monthly rebalance,
+T+1, trailing-stop basis and no-refill rules are unchanged. Balance is still
+realized-only: it does not include open MTM, and `shadow_pnl` remains gross.
+
+ETF delivery STT is 0.001% on domestic equity ETF sells and zero on buys;
+GOLDIETF, LIQUIDCASE and LTGILTBEES are exempt. The owner approved provisional
+DP of Rs12.50 plus GST for a full-position delivery sale (one symbol/day).
+MON100, HNGSNGBEES, SILVERBEES and any unregistered ETF are blocked from new
+buys with a notification until tax treatment is verified. See the vault's
+`Trading Charges - Arrow and Dhan Reference` for sources and limitations.
+
+Legacy positions without `charges` are reconstructed from their stored capital
+and exit proceeds for account calculations; they are not silently assumed
+cost-free. No historical momentum Mongo records were backfilled in this change.
+Legacy estimates cannot recover per-order rounding for unrecorded top-ups.
+
+Run `python test_net_pnl.py` for focused accounting, fee-reserve and blocked-ETF
+tests without connecting to broker, Mongo or Slack.
+
 Shared, read by both jobs (seeded once; already populated in prod):
 
 | Collection | `_id` | Contents |

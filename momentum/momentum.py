@@ -32,6 +32,7 @@ from dotenv import find_dotenv, load_dotenv
 from slack_sdk import WebClient
 from tamingnifty import connect_dhan as edge
 from tamingnifty import utils as util
+from tamingnifty.charges import etf_order_charges, etf_tax_segment, sum_charges
 
 load_dotenv(find_dotenv())
 
@@ -89,27 +90,49 @@ def compute_accounts():
     Nothing is incremented, so the ledger cannot drift: a run that dies midway
     is simply recomputed by the next one.
       invested       = capital tied up in open positions
-      total_pnl      = realised P&L over closed positions
-      unused_balance = start + pnl - invested
+      total_pnl      = gross realised P&L over closed positions
+      net_pnl        = realised P&L after round-trip charges
+      unused_balance = start + gross pnl - all incurred charges - invested
     """
     start = START_CAPITAL
     active = list(positions.find({"status": "active"}))
     closed = list(positions.find({"status": "closed"}))
-    pnls = [float(p.get("pnl") or 0.0) for p in closed]
+    pnls = []
+    net_pnls = []
+    all_charges = []
+    for pos in closed:
+        pnl = float(pos["pnl"])
+        charges = pos.get("charges")
+        if charges is None:
+            charges = sum_charges(
+                etf_order_charges(pos["symbol"], "BUY", pos["capital_deployed"]),
+                etf_order_charges(pos["symbol"], "SELL", float(pos["exit_price"]) * pos["quantity"]))
+        pnls.append(pnl)
+        net_pnls.append(round(pnl - charges["total"], 2))
+        all_charges.append(charges)
+    for pos in active:
+        charges = pos.get("charges")
+        if charges is None:
+            charges = etf_order_charges(pos["symbol"], "BUY", pos["capital_deployed"])
+        all_charges.append(charges)
 
     invested = round(sum(float(p["capital_deployed"]) for p in active), 2)
     total_pnl = round(sum(pnls), 2)
+    charges = sum_charges(*all_charges)
+    balance = round(start + total_pnl - charges["total"], 2)
     return {
         "start_capital": start,
-        "total_balance": round(start + total_pnl, 2),
-        "unused_balance": round(start + total_pnl - invested, 2),
+        "total_balance": balance,
+        "unused_balance": round(balance - invested, 2),
         "invested": invested,
         "total_trades": len(active) + len(closed),
         "active_trades": len(active),
         "closed_trades": len(closed),
-        "winning_trades": sum(1 for p in pnls if p > 0),
-        "losing_trades": sum(1 for p in pnls if p < 0),
+        "winning_trades": sum(1 for p in net_pnls if p > 0),
+        "losing_trades": sum(1 for p in net_pnls if p < 0),
         "total_pnl": total_pnl,
+        "net_pnl": round(sum(net_pnls), 2),
+        "charges": charges,
     }
 
 
@@ -219,27 +242,43 @@ def sell(conn, pos, reason):
         notify(f"MOMENTUM: SELL FAILED {sym} - {why_failed(order)}")
         return 0.0
     avg = float(order["averageTradedPrice"])
-    entry = float(pos["entry_price"])
     cap = float(pos["capital_deployed"])
-    pnl = round((avg - entry) * qty, 2)
+    pnl = round(avg * qty - cap, 2)
     roi = round(pnl / cap * 100, 2) if cap else 0.0
+    entry_charges = pos.get("charges")
+    if entry_charges is None:
+        entry_charges = etf_order_charges(sym, "BUY", cap)
+    charges = sum_charges(entry_charges, etf_order_charges(sym, "SELL", avg * qty))
+    net_pnl = round(pnl - charges["total"], 2)
 
     positions.update_one(
         {"symbol": sym, "status": "active"},
         {"$set": {"status": "closed", "exit_price": avg, "exit_date": str(today()),
-                  "pnl": pnl, "roi": roi, "exit_reason": reason}})
+                  "pnl": pnl, "net_pnl": net_pnl, "charges": charges,
+                  "roi": roi, "exit_reason": reason}})
     save_accounts()             # derived from the positions, so recompute AFTER the write
-    notify(f"MOMENTUM: SOLD {sym} x{qty} @ {avg:.2f} ({reason}) pnl=Rs{pnl:.0f} roi={roi:.1f}%")
+    notify(f"MOMENTUM: SOLD {sym} x{qty} @ {avg:.2f} ({reason}) gross=Rs{pnl:.2f} "
+           f"charges=Rs{charges['total']:.2f} net=Rs{net_pnl:.2f} gross_roi={roi:.1f}%")
     return round(avg * qty, 2)
 
 
 def buy(conn, sym, secid, tsym, bucket, alloc):
     """Market-buy `alloc` rupees of `sym`, floored to whole units, and record it."""
+    try:
+        etf_tax_segment(sym)
+    except ValueError as error:
+        notify(f"MOMENTUM: BUY BLOCKED {sym} - {error}. Verify ETF charges before entry.")
+        return None
     price = ltp(conn, secid)
     if not price or price <= 0:
         notify(f"MOMENTUM: no price for {sym}; skipping buy")
         return None                                     # local skip (not a broker rejection)
     qty = int(alloc / price)                            # whole ETF units only
+    while qty > 0:
+        charges = etf_order_charges(sym, "BUY", price * qty)
+        if price * qty + charges["total"] <= alloc:
+            break
+        qty -= 1
     if qty <= 0:                                        # skip if the slice buys 0 units
         notify(f"MOMENTUM: alloc Rs{alloc:.0f} buys 0 units of {sym}; skipping")
         return None                                     # local skip (not a broker rejection)
@@ -250,6 +289,7 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
         return False                                    # broker rejected (e.g. funds unsettled)
     avg = float(order["averageTradedPrice"])
     spend = round(avg * qty, 2)
+    charges = etf_order_charges(sym, "BUY", spend)
 
     open_pos = positions.find_one({"symbol": sym, "status": "active"})
     if open_pos:
@@ -266,10 +306,14 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
         # position really began.
         total_qty = open_pos["quantity"] + qty
         total_cap = round(float(open_pos["capital_deployed"]) + spend, 2)
+        previous_charges = open_pos.get("charges")
+        if previous_charges is None:
+            previous_charges = etf_order_charges(sym, "BUY", open_pos["capital_deployed"])
+        charges = sum_charges(previous_charges, charges)
         positions.update_one(
             {"symbol": sym, "status": "active"},
             {"$set": {"quantity": total_qty, "capital_deployed": total_cap,
-                      "entry_price": round(total_cap / total_qty, 4)}})
+                      "entry_price": round(total_cap / total_qty, 4), "charges": charges}})
         save_accounts()         # derived from the positions, so recompute AFTER the write
         notify(f"MOMENTUM: ADDED {sym} x{qty} @ {avg:.2f} (Rs{spend:.0f}) - now "
                f"x{total_qty}, avg cost {total_cap / total_qty:.2f}")
@@ -282,6 +326,7 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
         "marked_for_exit": False, "exit_reason": "",
         "ltp": avg, "last_close": avg, "shadow_pnl": 0.0,
         "exit_price": "", "exit_date": "", "pnl": "", "roi": 0.0,
+        "charges": charges, "net_pnl": None,
     })
     save_accounts()             # derived from the positions, so recompute AFTER the write
     notify(f"MOMENTUM: BOUGHT {sym} x{qty} @ {avg:.2f} (Rs{spend:.0f})")
@@ -319,9 +364,11 @@ def summary():
     holdings = [p["symbol"] for p in active_positions()]
     equity = round(acc["unused_balance"] + acc["invested"], 2)
     notify("MOMENTUM summary | holdings={h} | cash=Rs{c:.0f} | invested=Rs{i:.0f} | "
-           "equity=Rs{e:.0f} | realized_pnl=Rs{p:.0f} | W/L={w}/{l}".format(
+           "realized_balance=Rs{e:.0f} | realized_gross=Rs{p:.0f} | "
+           "realized_net=Rs{n:.0f} | incurred_charges=Rs{f:.0f} | net W/L={w}/{l}".format(
                h=holdings, c=acc["unused_balance"], i=acc["invested"], e=equity,
-               p=acc["total_pnl"], w=acc.get("winning_trades", 0),
+               p=acc["total_pnl"], n=acc["net_pnl"], f=acc["charges"]["total"],
+               w=acc.get("winning_trades", 0),
                l=acc.get("losing_trades", 0)))
 
 
