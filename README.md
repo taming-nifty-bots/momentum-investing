@@ -151,13 +151,14 @@ shopping list - it is the book we should end up holding**. Tomorrow it compares
 the holdings against the target again and the missing names are still missing.
 That one property is what makes the whole thing work:
 
-- **re-running is harmless** - reconciling twice changes nothing;
+- **a completed, fully persisted run can be repeated** - the recorded holdings
+  determine what is still missing; unresolved executions block restart;
 - **a missed `momentum` run** is simply picked up by the next session;
 - **a missed `signal` run** leaves the target as it was, so nothing unexpected
   is bought;
-- **every failure retries itself.** A rejected *sell* stays flagged and is sold
-  next session. A rejected *buy* leaves the name missing, so the next session
-  buys it. Neither needs a recovery path.
+- **confirmed zero-fill rejections can retry next session.** A rejected *sell*
+  stays flagged and a rejected *buy* leaves the name missing. Ambiguous submissions,
+  partial fills and persistence failures instead require manual reconciliation.
 
 So a rebalance that sells splits naturally across two sessions:
 
@@ -309,10 +310,11 @@ entry for a buy - so the job that places orders never looks one up.
 address the container actually egresses on at every run - that is the first thing
 to check when orders start getting refused.
 
-**A broker rejection is an expected outcome, not a crash.** Dhan answers a bad
-order with an HTTP error which the library raises; `place_market()` turns it back
-into a `{"orderStatus": "REJECTED"}` dict so the caller can inspect it and the
-job survives. Terminal success on Dhan is `TRADED`, not `COMPLETE`.
+**Only confirmed zero-fill terminal failures are safe to retry.** Placement
+exceptions (including HTTP errors/timeouts) now propagate into the durable
+fail-stop guard, because acceptance may be unknown. Pending/partial or inconsistent
+fills also stop. Explicit rejected/cancelled/expired orders with `filledQty=0`
+retain the next-session retry behavior. Terminal success is `TRADED`, not `COMPLETE`.
 
 **The strategy parameters are constants, not config.** They used to sit in an
 `etf_params` document in Mongo, which meant the strategy could be changed without
@@ -327,7 +329,7 @@ because it is data, and it is edited far more often.
 momentum-investing/
 |-- signal/
 |   |-- momentum_signal.py   # ALL decisions: stops + ranking daily, rotations + target while the month is open. No orders.
-|   |-- requirements.txt     # all deps (incl. tamingnifty==2.3.1)
+|   |-- requirements.txt     # all deps (incl. tamingnifty==2.4.3)
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)
 |-- momentum/
@@ -360,23 +362,27 @@ workflow): `signal` early in the morning, `momentum` shortly after the open.
 `signal` **must** finish before `momentum` starts - `momentum` acts on
 the target and the exit flags that `signal` writes, and decides nothing itself.
 
-**Neither job checks the calendar.** There is no weekday test and no holiday
-list in the code: if the job is started, it runs. Which days that happens on is
-entirely the cron schedule's business. That is deliberate - it means a session
-can be replayed on a weekend for testing, it means the market holiday list
-lives in one place (the schedule) instead of being duplicated in two jobs that
-would then have to be redeployed every time the exchange publishes a new one,
-and it means the **Budget special sessions NSE holds at a weekend**
-(`2025-02-01` Sat, `2026-02-01` Sun - real, price-continuous cash-segment days)
-can be traded by simply scheduling them. The old `weekday() < 5` test could not:
-2025-02-01 was the first trading session of February and it would have pushed
-that rebalance to the Monday.
-
-The cost is that a job fired on a holiday will still run: `signal` re-decides on
-the last published candle and `momentum` would act on it. Do not schedule one on
-a day the market is shut.
+Both jobs require `tamingnifty==2.4.3` and the annual `NSE:YYYY` document
+in `Bots.exchange_calendars`. Startup checks the IST trading date before broker
+login, market data, state writes or polling, in dry-run and live modes. Holidays
+and weekends exit successfully; missing/invalid calendars or DB failures abort
+nonzero (fail-closed). Seed and verify the current year's calendar before starting;
+cron alone does not establish a regular NSE session.
+Offline startup checks: `python test_startup_calendar.py`.
 
 ## Safety
+
+The executor checks `Bots.execution_guards` at startup before login. Each whole
+buy/sell operation (including order, position and accounts persistence) reserves
+scope `<MONGO_DB>.etf_positions_<user_name>` before execution. Ambiguous submissions,
+partial/unknown fills and unconfirmed writes stop nonzero with a durable pending/
+failed latch; paper mode uses the same protection. No automatic retry or restart
+clearance occurs. Reconcile broker orders/fills/holdings and Mongo records first,
+then manually clear only that scope's guard. Never clear a guard just to restart.
+An unresolved latch also prevents exits; arrange manual position management.
+Keep one executor per account: this latch is not exactly-once order deduplication
+or automatic broker-position reconciliation.
+Offline checks: `python test_execution_safety.py` and `python test_net_pnl.py`.
 
 - **`live_trading=false` (default) = DRY RUN.** `momentum` simulates fills at LTP,
   updates the Mongo ledger, and sends nothing to the broker. Set

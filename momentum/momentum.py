@@ -33,6 +33,7 @@ from slack_sdk import WebClient
 from tamingnifty import connect_dhan as edge
 from tamingnifty import utils as util
 from tamingnifty.charges import etf_order_charges, etf_tax_segment, sum_charges
+from tamingnifty.safety import assert_execution_clear, check_trading_day, guarded_execution
 
 load_dotenv(find_dotenv())
 
@@ -48,6 +49,7 @@ db = mongo_client[MONGO_DB]
 positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing else
 state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
 orders = db[f"etf_orders_{user_name}"]
+EXECUTION_SCOPE = f"{MONGO_DB}.etf_positions_{user_name}"
 
 # The signal job owns the ranking/stop parameters; this job owns only the money.
 START_CAPITAL = 400000.0
@@ -140,8 +142,14 @@ def save_accounts():
     """Recompute the ledger and store it. Mongo keeps a snapshot for reading;
     the positions remain the single source of truth."""
     acc = compute_accounts()
-    state.update_one({"_id": "accounts"}, {"$set": acc}, upsert=True)
+    check_write(state.update_one({"_id": "accounts"}, {"$set": acc}, upsert=True),
+                "accounts snapshot")
     return acc
+
+
+def check_write(result, action, require_match=False):
+    if not result.acknowledged or (require_match and result.matched_count != 1):
+        raise RuntimeError("Unconfirmed Mongo persistence: " + action)
 
 
 def get_meta():
@@ -207,19 +215,21 @@ def place_market(conn, secid, tsym, side, qty):
     if not live_trading:
         return simulated_order(tsym, side, qty, ltp(conn, secid))
 
-    try:
-        order = edge.place_equity_order(conn, secid, side, int(qty))
-    except Exception as exc:
-        # A rejection is an expected outcome (unsettled funds), and Dhan raises it
-        # as an HTTP error - hand the caller a dict instead of killing the job.
-        # exception_detail rather than str(exc) because str() on a requests HTTPError
-        # is "400 Client Error:  for url: ..." and drops Dhan's actual reason, which
-        # then gets written to the order log and Slack as the explanation.
-        return {"orderStatus": "REJECTED", "message": util.exception_detail(exc)}
+    # A timeout may mean the broker accepted the order; never call it a rejection.
+    order = edge.place_equity_order(conn, secid, side, int(qty))
     return edge.wait_for_fill(conn, order["orderId"])
 
 
 def filled(order):
+    if order.get("orderStatus") == "TRADED":
+        quantity = order.get("quantity")
+        if (not isinstance(quantity, int) or quantity <= 0
+                or order.get("filledQty") != quantity):
+            raise RuntimeError("Inconsistent traded quantity requires reconciliation: " + str(order))
+    if order.get("orderStatus") not in ("TRADED", "DRYRUN"):
+        if (order.get("orderStatus") not in ("REJECTED", "CANCELLED", "EXPIRED")
+                or order.get("filledQty") != 0):
+            raise RuntimeError("Unresolved/partial order requires reconciliation: " + str(order))
     return order.get("orderStatus") in ("TRADED", "DRYRUN")
 
 
@@ -237,7 +247,7 @@ def sell(conn, pos, reason):
         notify(f"MOMENTUM: SELL SKIPPED {sym} - no secid on the position document.")
         return 0.0
     order = place_market(conn, secid, tsym, "SELL", qty)
-    orders.insert_one(dict(order))
+    check_write(orders.insert_one(dict(order)), "sell order")
     if not filled(order):
         notify(f"MOMENTUM: SELL FAILED {sym} - {why_failed(order)}")
         return 0.0
@@ -251,11 +261,11 @@ def sell(conn, pos, reason):
     charges = sum_charges(entry_charges, etf_order_charges(sym, "SELL", avg * qty))
     net_pnl = round(pnl - charges["total"], 2)
 
-    positions.update_one(
+    check_write(positions.update_one(
         {"symbol": sym, "status": "active"},
         {"$set": {"status": "closed", "exit_price": avg, "exit_date": str(today()),
                   "pnl": pnl, "net_pnl": net_pnl, "charges": charges,
-                  "roi": roi, "exit_reason": reason}})
+                  "roi": roi, "exit_reason": reason}}), "closed position", require_match=True)
     save_accounts()             # derived from the positions, so recompute AFTER the write
     notify(f"MOMENTUM: SOLD {sym} x{qty} @ {avg:.2f} ({reason}) gross=Rs{pnl:.2f} "
            f"charges=Rs{charges['total']:.2f} net=Rs{net_pnl:.2f} gross_roi={roi:.1f}%")
@@ -283,7 +293,7 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
         notify(f"MOMENTUM: alloc Rs{alloc:.0f} buys 0 units of {sym}; skipping")
         return None                                     # local skip (not a broker rejection)
     order = place_market(conn, secid, tsym, "BUY", qty)
-    orders.insert_one(dict(order))
+    check_write(orders.insert_one(dict(order)), "buy order")
     if not filled(order):
         notify(f"MOMENTUM: BUY FAILED {sym} - {why_failed(order)}")
         return False                                    # broker rejected (e.g. funds unsettled)
@@ -310,16 +320,17 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
         if previous_charges is None:
             previous_charges = etf_order_charges(sym, "BUY", open_pos["capital_deployed"])
         charges = sum_charges(previous_charges, charges)
-        positions.update_one(
+        check_write(positions.update_one(
             {"symbol": sym, "status": "active"},
             {"$set": {"quantity": total_qty, "capital_deployed": total_cap,
-                      "entry_price": round(total_cap / total_qty, 4), "charges": charges}})
+                      "entry_price": round(total_cap / total_qty, 4), "charges": charges}}),
+                    "position top-up", require_match=True)
         save_accounts()         # derived from the positions, so recompute AFTER the write
         notify(f"MOMENTUM: ADDED {sym} x{qty} @ {avg:.2f} (Rs{spend:.0f}) - now "
                f"x{total_qty}, avg cost {total_cap / total_qty:.2f}")
         return True
 
-    positions.insert_one({
+    check_write(positions.insert_one({
         "symbol": sym, "secid": secid, "tsym": tsym, "bucket": bucket,
         "entry_price": avg, "quantity": qty, "capital_deployed": spend,
         "entry_date": str(today()), "peak": avg, "status": "active",
@@ -327,7 +338,7 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
         "ltp": avg, "last_close": avg, "shadow_pnl": 0.0,
         "exit_price": "", "exit_date": "", "pnl": "", "roi": 0.0,
         "charges": charges, "net_pnl": None,
-    })
+    }), "new position")
     save_accounts()             # derived from the positions, so recompute AFTER the write
     notify(f"MOMENTUM: BOUGHT {sym} x{qty} @ {avg:.2f} (Rs{spend:.0f})")
     return True
@@ -349,8 +360,9 @@ def place_new_entries(conn, new_entries, available):
         if not secid:
             notify(f"MOMENTUM: no secid on the target entry for {sym}; skipping")
             continue
-        result = buy(conn, sym, secid, entry.get("tsym") or sym,
-                     entry.get("bucket", ""), alloc_each)
+        result = guarded_execution(
+            mongo_client, EXECUTION_SCOPE, notify, "BUY " + sym, buy,
+            conn, sym, secid, entry.get("tsym") or sym, entry.get("bucket", ""), alloc_each)
         if result is False:                             # broker rejected the order
             notify(f"MOMENTUM: buy REJECTED - broker declined (e.g. funds unsettled). "
                    f"Skipping the remaining entries; they stay missing from the target "
@@ -373,8 +385,9 @@ def summary():
 
 
 def main():
-    # No calendar check here. Which days this job runs is decided by the Azure
-    # cron schedule, so weekends and market holidays are handled there.
+    if not check_trading_day(mongo_client, notify):
+        return
+    assert_execution_clear(mongo_client, EXECUTION_SCOPE, notify)
     mode = "LIVE" if live_trading else "DRY-RUN"
     conn = edge.login_to_dhan(slack_channel=slack_channel)
     notify(f"MOMENTUM started [{mode}] (NSE)")
@@ -385,7 +398,8 @@ def main():
     for pos in active_positions():
         if pos.get("marked_for_exit"):
             time.sleep(1)
-            sell(conn, pos, pos.get("exit_reason") or "trailing_stop")
+            guarded_execution(mongo_client, EXECUTION_SCOPE, notify, "SELL " + pos["symbol"],
+                              sell, conn, pos, pos.get("exit_reason") or "trailing_stop")
             sold_today.append(pos["symbol"])
 
     # 2. Sold something? Stop - Dhan settles T+1. Nothing is written down for

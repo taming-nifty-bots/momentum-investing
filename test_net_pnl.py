@@ -42,16 +42,23 @@ def buy_namespace(open_position=None):
     inserts = []
     updates = []
     messages = []
+    def insert(doc):
+        inserts.append(doc)
+        return SimpleNamespace(acknowledged=True)
+
+    def update(query, changes):
+        updates.append(changes["$set"])
+        return SimpleNamespace(acknowledged=True, matched_count=1)
+
     namespace = dict(
         positions=SimpleNamespace(find_one=lambda query: open_position,
-                                  insert_one=lambda doc: inserts.append(doc),
-                                  update_one=lambda query, update: updates.append(update["$set"])),
-        orders=SimpleNamespace(insert_one=lambda order: None),
+                                  insert_one=insert, update_one=update),
+        orders=SimpleNamespace(insert_one=lambda order: SimpleNamespace(acknowledged=True)),
         notify=messages.append, ltp=lambda *args: 100,
         place_market=lambda conn, secid, tsym, side, qty: dict(
             orderStatus="DRYRUN", averageTradedPrice=100),
         filled=lambda order: True, save_accounts=lambda: None, today=lambda: "2026-10-26")
-    load_functions({"buy"}, namespace)
+    load_functions({"buy", "check_write"}, namespace)
     return namespace, inserts, updates, messages
 
 
@@ -89,12 +96,17 @@ def test_sell_records_gross_and_net_and_keeps_gross_roi():
     writes = []
     position = dict(symbol="PHARMABEES", quantity=1000, secid="1",
                     entry_price=100, capital_deployed=100000)
+    def update(query, changes):
+        writes.append(changes["$set"])
+        return SimpleNamespace(acknowledged=True, matched_count=1)
+
     namespace = dict(
-        positions=SimpleNamespace(update_one=lambda query, update: writes.append(update["$set"])),
-        orders=SimpleNamespace(insert_one=lambda order: None), notify=lambda message: None,
+        positions=SimpleNamespace(update_one=update),
+        orders=SimpleNamespace(insert_one=lambda order: SimpleNamespace(acknowledged=True)),
+        notify=lambda message: None,
         place_market=lambda *args: dict(orderStatus="DRYRUN", averageTradedPrice=110),
         filled=lambda order: True, save_accounts=lambda: None, today=lambda: "2026-10-26")
-    load_functions({"sell"}, namespace)
+    load_functions({"sell", "check_write"}, namespace)
     proceeds = namespace["sell"](None, position, "test")
     assert proceeds == 110000
     assert writes[0]["pnl"] == 10000

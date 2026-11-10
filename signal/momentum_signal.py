@@ -33,6 +33,7 @@ from dotenv import find_dotenv, load_dotenv
 from slack_sdk import WebClient
 from tamingnifty import connect_dhan as edge
 from tamingnifty import utils as util
+from tamingnifty.safety import check_trading_day
 
 load_dotenv(find_dotenv())
 
@@ -243,8 +244,8 @@ def load_universe():
 
 
 def main():
-    # No calendar check here. Which days this job runs is decided by the Azure
-    # cron schedule, so weekends and market holidays are handled there.
+    if not check_trading_day(mongo_client, notify):
+        return
     candidates, secid_of, tsym_of, bucket_of = load_universe()
 
     conn = edge.login_to_dhan(slack_channel=slack_channel)
