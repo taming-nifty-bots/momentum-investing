@@ -69,10 +69,19 @@ def test_buy_persistence_failure_latches_and_blocks_restart():
 def test_ambiguous_submission_is_not_converted_to_rejection():
     client, documents = guard_client()
     broker = Mock(side_effect=TimeoutError("response lost after submission"))
-    namespace = dict(live_trading=True, edge=SimpleNamespace(place_equity_order=broker))
+    namespace = dict(live_trading=True, notify=Mock(),
+        time=SimpleNamespace(time=lambda: 0), math=__import__("math"), util=SimpleNamespace(
+        ist_now=lambda: __import__("datetime").datetime(2026, 12, 1, 9, 29),
+        exception_detail=str), uuid4=lambda: SimpleNamespace(hex="test"),
+        edge=SimpleNamespace(prepare_order=Mock(return_value=dict(
+            request=dict(price=100), policy=dict(tick=0.01, max_price=101))),
+            round_execution_price=lambda price, tick, side: price,
+            submit_prepared_order=broker),
+        orders=SimpleNamespace(insert_one=Mock(return_value=SimpleNamespace(acknowledged=True))))
+    load_functions({"check_write"}, namespace)
     load_functions({"place_market"}, namespace)
     assert_stopped(guarded_execution, client, "Bots.etf_positions_test", Mock(), "BUY",
-                   namespace["place_market"], None, "1", "PHARMABEES", "BUY", 1)
+                   namespace["place_market"], None, "1", "PHARMABEES", "BUY", 1, 1000)
     assert broker.call_count == 1
     assert documents["Bots.etf_positions_test"]["status"] == "failed"
 
@@ -114,6 +123,7 @@ def test_sell_failure_after_submission_retains_guard():
     client, documents = guard_client()
     broker = Mock(return_value=dict(orderStatus="DRYRUN", averageTradedPrice=110))
     namespace = dict(place_market=broker,
+                     live_trading=False,
                      orders=SimpleNamespace(insert_one=Mock(side_effect=RuntimeError("order log lost"))))
     load_functions({"sell", "check_write"}, namespace)
     position = dict(symbol="PHARMABEES", secid="1", quantity=10)

@@ -6,9 +6,48 @@ as the author's other live strategies: **Dhan via the
 `tamingnifty` package** with **MongoDB** as the ledger, split into two small,
 self-contained, scheduled container jobs.
 
-> **Not yet cleared for real money.** This strategy has zero forward-test credit.
-> The 100-trade rule applies: it must forward-test in **DRY RUN** (`live_trading=false`)
-> before `live_trading=true` is ever set. See *Safety* below.
+> **Live preparation approved November 24, 2026; orders remain disabled.**
+> The owner explicitly approved an exception to the unmet 100-forward-trade
+> requirement. This is not evidence of profitability. Both jobs default to
+> `live_trading=false`; switching both to `true` selects an empty, separate live
+> ledger with a **Rs200,000 total strategy budget**, including estimated charges.
+> No live signals or orders run before **December 1, 2026**.
+
+## December live handoff
+
+- Keep `live_trading=false` on both Azure jobs until funding and broker setup
+  are ready. To activate, set **the same flag to true on both jobs**, signal first,
+  before the morning signal schedule. No code change or ledger reset is needed.
+- Paper collections remain `etf_positions_<user>`, `etf_state_<user>` and
+  `etf_orders_<user>`, with their existing Rs400,000 base.
+  Live uses the corresponding `<user>_live` suffix and a separate execution guard.
+  Never copy paper holdings, P&L, targets or rebalance stamps into the live ledger.
+  Switching back to false selects paper; it does **not** liquidate live holdings.
+- First eligible session is December 1, subject to the verified NSE calendar.
+  Existing schedules are signal **08:05 IST**, executor **09:29 IST**.
+  The signal must complete successfully that morning before orders are allowed.
+  A missed first session can retry later; no mid-month refill after completion.
+- Rs200,000 is the entire budget, not Rs200,000 plus fees. Freed cash is split
+  across eligible missing targets; four names initially receive about Rs50,000
+  each. Fewer names can receive larger allocations, up to almost the full book.
+  Retained winners are neither trimmed nor topped up.
+- Live buys reserve a 1% price move plus entry charges when sizing, then use a
+  fresh depth-priced CNC LIMIT, bounded by their cash allocation and a 15-second
+  long-entry deadline. Repricing cannot raise the cap. Pending/partial fills,
+  submission ambiguity or failed writes stop the durable guard for manual
+  reconciliation; they are never automatically treated as zero-fill failures.
+- An order intent (including correlation ID and prepared LIMIT policy) is saved
+  before submission in the existing live orders collection. Broker responses
+  are persisted before the batched Slack timeline. Errors are immediate.
+- Live data never falls back to the last daily close for order sizing. The signal
+  requires completed candles from the previous NSE session for all candidates
+  and holdings; the executor refuses a stale/missing daily completion stamp.
+  Same-day reruns after a recorded sale cannot reuse T+1 proceeds.
+- Before activation, verify at least Rs200,000 settled, unencumbered funds,
+  no unreconciled existing ETF holdings/orders, Dhan CNC delivery-sale
+  authorization and the job's static egress IP whitelist. Broker fills, these
+  account prerequisites and contract-note charges remain unverified by offline tests.
+  Existing blocked tax classifications and provisional DP charges remain unchanged.
 
 ## The strategy (exact rules)
 
@@ -99,7 +138,7 @@ the moment it writes the plan.
 
   *(Every run asks **one** liquid name - `NIFTYBEES`, the `CALENDAR_REF`
   constant - for the newest daily bar, and stamps that date on the plan and on
-  `meta.last_candle_date`. It is a **record, not a gate**: the job does not stop
+  `meta.last_candle_date`. In **paper mode** it is a **record, not a gate**: the job does not stop
   when the bar is unchanged since the last run, it just says so in Slack next to
   the wall clock. Deciding whether today's bar is published yet is done by
   choosing the cron slot, by hand. Which session is "now" is a property of the
@@ -329,7 +368,7 @@ because it is data, and it is edited far more often.
 momentum-investing/
 |-- signal/
 |   |-- momentum_signal.py   # ALL decisions: stops + ranking daily, rotations + target while the month is open. No orders.
-|   |-- requirements.txt     # all deps (incl. tamingnifty==2.4.3)
+|   |-- requirements.txt     # all deps (incl. tamingnifty==2.4.7)
 |   |-- Dockerfile           # COPY . ; pip install -r src/requirements.txt
 |   `-- .env                 # secrets (gitignored)
 |-- momentum/
@@ -362,7 +401,7 @@ workflow): `signal` early in the morning, `momentum` shortly after the open.
 `signal` **must** finish before `momentum` starts - `momentum` acts on
 the target and the exit flags that `signal` writes, and decides nothing itself.
 
-Both jobs require `tamingnifty==2.4.3` and the annual `NSE:YYYY` document
+Both jobs require `tamingnifty==2.4.7` and the annual `NSE:YYYY` document
 in `Bots.exchange_calendars`. Startup checks the IST trading date before broker
 login, market data, state writes or polling, in dry-run and live modes. Holidays
 and weekends exit successfully; missing/invalid calendars or DB failures abort
@@ -374,7 +413,7 @@ Offline startup checks: `python test_startup_calendar.py`.
 
 The executor checks `Bots.execution_guards` at startup before login. Each whole
 buy/sell operation (including order, position and accounts persistence) reserves
-scope `<MONGO_DB>.etf_positions_<user_name>` before execution. Ambiguous submissions,
+scope `<MONGO_DB>.etf_positions_<ledger_user>` before execution. Ambiguous submissions,
 partial/unknown fills and unconfirmed writes stop nonzero with a durable pending/
 failed latch; paper mode uses the same protection. No automatic retry or restart
 clearance occurs. Reconcile broker orders/fills/holdings and Mongo records first,
@@ -382,14 +421,19 @@ then manually clear only that scope's guard. Never clear a guard just to restart
 An unresolved latch also prevents exits; arrange manual position management.
 Keep one executor per account: this latch is not exactly-once order deduplication
 or automatic broker-position reconciliation.
-Offline checks: `python test_execution_safety.py` and `python test_net_pnl.py`.
+Offline checks: `python -m unittest test_startup_calendar test_live_preparation`,
+`python test_execution_safety.py` and `python test_net_pnl.py`.
+CI runs these before building/deploying, checks image imports and refuses a
+deployment while either job is running; it never stops/restarts an execution.
+Both build contexts exclude `.env` files and Python caches.
 
 - **`live_trading=false` (default) = DRY RUN.** `momentum` simulates fills at LTP,
   updates the Mongo ledger, and sends nothing to the broker. Set
   `live_trading=true` only after explicit go-live sign-off. Same flag name and
   same true/false values as the other strategies.
-- **100-trade rule.** This strategy has not been forward-tested. Run it in dry run
-  and collect >= 100 trades before considering real capital.
+- **100-trade rule.** The forward-test requirement remains unmet. The owner
+  explicitly approved this strategy's exception on November 24, 2026;
+  this is not a general relaxation or a claim of a validated edge.
 - **Concentration.** See the runaway-winner caveat above - size total capital with
   the understanding that a single ETF can dominate the book.
 
@@ -427,5 +471,5 @@ Offline checks: `python test_execution_safety.py` and `python test_net_pnl.py`.
   against Dhan's NSE cash scrip master on 2026-09-25 — every one matches Dhan's
   `SECURITY_ID` exactly (0 mismatch, 0 missing), so the universe needed no
   change for the broker move.
-- **Not** yet validated: live broker fills, slippage, real-world execution - those
-  only come from the dry-run forward test.
+- **Not** yet validated: live broker fills, slippage, real-world execution.
+  Offline mocks and dry-run fills do not validate these.

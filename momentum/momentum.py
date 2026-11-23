@@ -23,8 +23,11 @@ list, and how that makes T+1 and every retry fall out for free.
 SAFETY: orders are DRY RUN unless live_trading=true.
 """
 import os
+import inspect
+import math
 import time
 import traceback
+from uuid import uuid4
 from datetime import datetime
 
 from pymongo import MongoClient
@@ -37,7 +40,14 @@ from tamingnifty.safety import assert_execution_clear, check_trading_day, guarde
 
 load_dotenv(find_dotenv())
 
-live_trading = os.environ.get("live_trading", "false").lower() == "true"
+def live_mode():
+    mode = os.environ.get("live_trading", "false").strip().lower()
+    if mode not in ("true", "false"):
+        raise ValueError("live_trading must be true or false")
+    return mode == "true"
+
+
+live_trading = live_mode()
 CONNECTION_STRING = os.environ.get("CONNECTION_STRING")
 user_name = os.environ.get("user_name", "sugam")
 MONGO_DB = os.environ.get("MONGO_DB", "Bots")
@@ -46,13 +56,15 @@ slack_client = WebClient(token=os.environ.get("slack_token"))
 
 mongo_client = MongoClient(CONNECTION_STRING)
 db = mongo_client[MONGO_DB]
-positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing else
-state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
-orders = db[f"etf_orders_{user_name}"]
-EXECUTION_SCOPE = f"{MONGO_DB}.etf_positions_{user_name}"
+ledger_user = user_name + "_live" if live_trading else user_name
+positions = db[f"etf_positions_{ledger_user}"]
+state = db[f"etf_state_{ledger_user}"]
+orders = db[f"etf_orders_{ledger_user}"]
+EXECUTION_SCOPE = f"{MONGO_DB}.etf_positions_{ledger_user}"
 
 # The signal job owns the ranking/stop parameters; this job owns only the money.
-START_CAPITAL = 400000.0
+START_CAPITAL = 200000.0 if live_trading else 400000.0
+LIVE_START_DATE = "2026-12-01"
 
 
 def notify(message):
@@ -65,7 +77,7 @@ def notify(message):
 
 
 def today():
-    return datetime.now().date()
+    return util.ist_now().date()
 
 
 def month_key():
@@ -185,11 +197,15 @@ def ltp(conn, secid):
         if price:
             return float(price)
     except Exception as exc:
+        if live_trading:
+            raise
         # The daily-close fallback below is the right behaviour, but swallowing this
         # silently meant a broken LTP feed looked identical to a healthy one that
         # simply had no quote - and the price used for sizing was quietly stale.
         print(f"[ltp] live quote for {secid} unavailable, falling back to the last "
               f"daily close: {util.exception_detail(exc)}", flush=True)
+    if live_trading:
+        raise ValueError("No fresh live price for " + str(secid))
     return last_daily_close(conn, secid)
 
 
@@ -206,18 +222,66 @@ def simulated_order(tsym, side, qty, price):
     }
 
 
-def place_market(conn, secid, tsym, side, qty):
-    """CNC MARKET order for `qty` units of `tsym`. DRY RUN unless live_trading=true."""
+def place_market(conn, secid, tsym, side, qty, alloc=None):
+    """CNC depth-priced LIMIT in live mode; LTP simulation in paper mode."""
     side = side.upper()
-    if qty is None or qty <= 0:
+    if not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0:
         raise ValueError(f"place_market: non-positive qty {qty} for {tsym}")
 
     if not live_trading:
         return simulated_order(tsym, side, qty, ltp(conn, secid))
 
-    # A timeout may mean the broker accepted the order; never call it a rejection.
-    order = edge.place_equity_order(conn, secid, side, int(qty))
-    return edge.wait_for_fill(conn, order["orderId"])
+    timeline = []
+    def event(message):
+        text = util.ist_now().strftime("%H:%M:%S") + " | " + message
+        print(text, flush=True)
+        timeline.append(text)
+
+    order_key = "LIVE-" + uuid4().hex
+    try:
+        event(f"{side} {tsym} x{qty} | preparing fresh depth")
+        prepared = edge.prepare_order(
+            conn, secid, side, qty, "NSE_EQ", "CNC",
+            entry_deadline=time.time() + 15 if side == "BUY" else None,
+            correlation_id=order_key, on_event=event)
+        if side == "BUY":
+            if alloc is None or not math.isfinite(alloc) or alloc <= 0:
+                raise ValueError("Live BUY needs a finite positive allocation")
+            tick = prepared["policy"]["tick"]
+            reserve = etf_order_charges(tsym.removesuffix("-EQ"), "BUY", alloc)["total"]
+            limit = edge.round_execution_price((alloc - reserve) / qty, tick, "SELL")
+            if limit < prepared["request"]["price"]:
+                raise ValueError("Fresh depth exceeds allocated cash; no order submitted")
+            prepared["policy"]["max_price"] = min(prepared["policy"]["max_price"], limit)
+        check_write(orders.insert_one(dict(
+            _id=order_key, prepared=prepared, orderStatus="INTENT",
+            tradingSymbol=tsym, transactionType=side, quantity=qty)), "live order intent")
+        event("Intent persisted | submitting LIMIT")
+        order = edge.submit_prepared_order(conn, prepared)
+        check_write(orders.update_one(
+            {"_id": order_key}, {"$set": dict(order)}, upsert=False),
+                    "submitted order", require_match=True)
+        result = edge.wait_for_fill(conn, order["orderId"], prepared=prepared,
+                                    on_event=event, on_alert=notify)
+        check_write(orders.update_one(
+            {"_id": order_key}, {"$set": dict(result)}), "broker result", require_match=True)
+        if (result.get("quantity") != qty or result.get("transactionType") != side
+                or str(result.get("securityId")) != str(secid)
+                or result.get("productType") != "CNC"):
+            raise ValueError("Broker order does not match requested ETF order")
+        filled(result)
+        if result.get("orderStatus") == "TRADED":
+            price = float(result["averageTradedPrice"])
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("Invalid broker fill price")
+            if side == "BUY" and price * qty + etf_order_charges(tsym.removesuffix("-EQ"), "BUY", price * qty)["total"] > alloc:
+                raise ValueError("Broker fill exceeds allocation; reconcile before continuing")
+        return result
+    except Exception as error:
+        notify("MOMENTUM live order failed/uncertain: " + util.exception_detail(error))
+        raise
+    finally:
+        notify("MOMENTUM order timeline | " + tsym + "\n" + "\n".join(timeline))
 
 
 def filled(order):
@@ -241,13 +305,17 @@ def why_failed(order):
 def sell(conn, pos, reason):
     """Market-sell a full position, realize P&L and update the ledger."""
     sym, qty = pos["symbol"], pos["quantity"]
+    if live_trading:
+        current = positions.find_one({"symbol": sym, "status": "active"})
+        if current is None or current["quantity"] != qty:
+            raise ValueError("Live holding changed before SELL; reconcile " + sym)
     tsym = pos.get("tsym") or sym
     secid = pos.get("secid")
     if not secid:
-        notify(f"MOMENTUM: SELL SKIPPED {sym} - no secid on the position document.")
-        return 0.0
+        raise ValueError(f"MOMENTUM: cannot sell {sym} - no secid on position")
     order = place_market(conn, secid, tsym, "SELL", qty)
-    check_write(orders.insert_one(dict(order)), "sell order")
+    if not live_trading:
+        check_write(orders.insert_one(dict(order)), "sell order")
     if not filled(order):
         notify(f"MOMENTUM: SELL FAILED {sym} - {why_failed(order)}")
         return 0.0
@@ -274,26 +342,35 @@ def sell(conn, pos, reason):
 
 def buy(conn, sym, secid, tsym, bucket, alloc):
     """Market-buy `alloc` rupees of `sym`, floored to whole units, and record it."""
+    if live_trading:
+        if positions.find_one({"symbol": sym, "status": "active"}):
+            raise ValueError("Live holding already exists; refusing duplicate BUY " + sym)
+        if compute_accounts()["unused_balance"] < alloc:
+            raise ValueError("Live cash changed before BUY; recalculate allocation")
     try:
         etf_tax_segment(sym)
     except ValueError as error:
         notify(f"MOMENTUM: BUY BLOCKED {sym} - {error}. Verify ETF charges before entry.")
         return None
     price = ltp(conn, secid)
-    if not price or price <= 0:
+    if not price or not math.isfinite(price) or price <= 0:
         notify(f"MOMENTUM: no price for {sym}; skipping buy")
         return None                                     # local skip (not a broker rejection)
-    qty = int(alloc / price)                            # whole ETF units only
+    sizing_price = price * 1.01 if live_trading else price
+    qty = int(alloc / sizing_price)
     while qty > 0:
-        charges = etf_order_charges(sym, "BUY", price * qty)
-        if price * qty + charges["total"] <= alloc:
+        charges = etf_order_charges(sym, "BUY", sizing_price * qty)
+        if sizing_price * qty + charges["total"] <= alloc:
             break
         qty -= 1
     if qty <= 0:                                        # skip if the slice buys 0 units
         notify(f"MOMENTUM: alloc Rs{alloc:.0f} buys 0 units of {sym}; skipping")
         return None                                     # local skip (not a broker rejection)
-    order = place_market(conn, secid, tsym, "BUY", qty)
-    check_write(orders.insert_one(dict(order)), "buy order")
+    if live_trading:
+        order = place_market(conn, secid, tsym, "BUY", qty, alloc=alloc)
+    else:
+        order = place_market(conn, secid, tsym, "BUY", qty)
+        check_write(orders.insert_one(dict(order)), "buy order")
     if not filled(order):
         notify(f"MOMENTUM: BUY FAILED {sym} - {why_failed(order)}")
         return False                                    # broker rejected (e.g. funds unsettled)
@@ -384,10 +461,34 @@ def summary():
                l=acc.get("losing_trades", 0)))
 
 
+def live_ready():
+    if not live_trading:
+        return True
+    if str(today()) < LIVE_START_DATE:
+        notify(f"MOMENTUM LIVE waiting until {LIVE_START_DATE}; no orders.")
+        return False
+    if "on_event" not in inspect.signature(edge.prepare_order).parameters:
+        raise RuntimeError("Live execution requires tamingnifty 2.4.7 event hooks")
+    for hook in ("prepared", "on_event", "on_alert"):
+        if hook not in inspect.signature(edge.wait_for_fill).parameters:
+            raise RuntimeError("Live execution missing wait_for_fill hook: " + hook)
+    meta = get_meta()
+    if meta.get("last_signal_date") != str(today()):
+        raise ValueError("Live signal has not completed today; refusing all orders")
+    if not meta.get("last_candle_date") or meta["last_candle_date"] >= str(today()):
+        raise ValueError("Live signal needs a completed previous-session candle")
+    moment = util.ist_now()
+    if not "09:15" <= moment.strftime("%H:%M") < "15:30":
+        raise ValueError("Live orders are restricted to the regular NSE session")
+    return True
+
+
 def main():
     if not check_trading_day(mongo_client, notify):
         return
     assert_execution_clear(mongo_client, EXECUTION_SCOPE, notify)
+    if not live_ready():
+        return
     mode = "LIVE" if live_trading else "DRY-RUN"
     conn = edge.login_to_dhan(slack_channel=slack_channel)
     notify(f"MOMENTUM started [{mode}] (NSE)")
@@ -409,6 +510,10 @@ def main():
                f"until the next session, so no entries today.")
         summary()
         return
+    if live_trading and positions.find_one({"status": "closed", "exit_date": str(today())}):
+        notify("MOMENTUM: a live sale is already recorded today; no T+1 entries on rerun.")
+        summary()
+        return
 
     # 3. Nothing sold, so our cash is settled - buy what the target is missing.
     plan = get_plan()
@@ -418,6 +523,8 @@ def main():
         return
 
     this_month = month_key()
+    if live_trading and plan.get("for_month") != this_month:
+        raise ValueError("Live rebalance plan is not for the current month")
     target = plan.get("target") or []
     held = {p["symbol"] for p in active_positions()}
     missing = [t for t in target if t["symbol"] not in held]

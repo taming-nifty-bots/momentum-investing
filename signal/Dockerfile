@@ -11,6 +11,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # never baked into the image).
 ENV MONGO_DB="Bots"
 ENV user_name="sugam"
+ENV live_trading="false"
 
 # Copy the job into the image
 COPY . /app/src/

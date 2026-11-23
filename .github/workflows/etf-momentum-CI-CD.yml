@@ -1,12 +1,11 @@
 name: Build and Deploy ETF Momentum Rotation
 
 # Mirrors the other strategies' CI/CD: build one image per job folder, push to
-# ACR, update the two scheduled Azure Container App Jobs, and restart any that
-# are running so they pick up the new image.
+# ACR and update the two scheduled Azure Container App Jobs only while idle.
 #   * signal   -> after the NSE close   (e.g. 18:00 IST, Mon-Fri)
 #   * momentum -> just after the open   (e.g. 09:20 IST, Mon-Fri)
 #
-# The universe/params live in Mongo and are seeded manually (one-time) - that is
+# The universe lives in Mongo and is seeded manually (one-time) - that is
 # intentionally NOT part of this pipeline.
 
 on:
@@ -19,6 +18,10 @@ env:
   SIGNAL_IMAGE_NAME: etf-momentum-signal:${{ github.run_number }}
   MOMENTUM_IMAGE_NAME: etf-momentum:${{ github.run_number }}
 
+concurrency:
+  group: etf-momentum-deployment
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -26,6 +29,18 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test before deployment
+        run: |
+          pip install -r momentum/requirements.txt
+          python -m unittest test_startup_calendar test_live_preparation
+          python test_net_pnl.py
+          python test_execution_safety.py
 
       - name: Log in to Azure
         uses: azure/login@v1
@@ -45,10 +60,29 @@ jobs:
           docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }} ./signal
           docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }} ./momentum
 
+      - name: Check image imports without starting jobs
+        run: |
+          docker run --rm --entrypoint python ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }} -c "import sys; sys.path.insert(0, '/app/src'); import momentum_signal; assert not momentum_signal.live_trading"
+          docker run --rm --entrypoint python ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }} -c "import sys; sys.path.insert(0, '/app/src'); import momentum; assert not momentum.live_trading"
+          docker run --rm -e live_trading=true --entrypoint python ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }} -c "import sys; sys.path.insert(0, '/app/src'); import momentum_signal; assert momentum_signal.ledger_user.endswith('_live')"
+          docker run --rm -e live_trading=true --entrypoint python ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }} -c "import sys; sys.path.insert(0, '/app/src'); import momentum; assert momentum.START_CAPITAL == 200000; assert momentum.ledger_user.endswith('_live')"
+
       - name: Push Docker images
         run: |
           docker push ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }}
           docker push ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }}
+
+      - name: Refuse deployment while either job is running
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            for job in "${{ secrets.ETF_SIGNAL_JOB_NAME }}" "${{ secrets.ETF_MOMENTUM_JOB_NAME }}"; do
+              count=$(az containerapp job execution list --name "$job" --resource-group "${{ secrets.RESOURCE_GROUP }}" --query "length([?properties.status=='Running'])" -o tsv)
+              if [ "$count" != "0" ]; then
+                echo "Deployment blocked: $job has a running execution."
+                exit 1
+              fi
+            done
 
       - name: Deploy SIGNAL job
         uses: azure/CLI@v1
@@ -67,23 +101,3 @@ jobs:
               --name ${{ secrets.ETF_MOMENTUM_JOB_NAME }} \
               --resource-group ${{ secrets.RESOURCE_GROUP }} \
               --image ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.MOMENTUM_IMAGE_NAME }}
-
-      - name: Restart running SIGNAL jobs
-        uses: azure/CLI@v1
-        with:
-          inlineScript: |
-            running_jobs=$(az containerapp job execution list --name ${{ secrets.ETF_SIGNAL_JOB_NAME }} --resource-group ${{ secrets.RESOURCE_GROUP }} --query "[?properties.status=='Running']")
-            if [ "$running_jobs" != "[]" ]; then
-              az containerapp job stop -n ${{ secrets.ETF_SIGNAL_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
-              az containerapp job start -n ${{ secrets.ETF_SIGNAL_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
-            fi
-
-      - name: Restart running MOMENTUM jobs
-        uses: azure/CLI@v1
-        with:
-          inlineScript: |
-            running_jobs=$(az containerapp job execution list --name ${{ secrets.ETF_MOMENTUM_JOB_NAME }} --resource-group ${{ secrets.RESOURCE_GROUP }} --query "[?properties.status=='Running']")
-            if [ "$running_jobs" != "[]" ]; then
-              az containerapp job stop -n ${{ secrets.ETF_MOMENTUM_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
-              az containerapp job start -n ${{ secrets.ETF_MOMENTUM_JOB_NAME }} -g ${{ secrets.RESOURCE_GROUP }}
-            fi

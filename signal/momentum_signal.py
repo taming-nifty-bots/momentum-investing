@@ -33,10 +33,18 @@ from dotenv import find_dotenv, load_dotenv
 from slack_sdk import WebClient
 from tamingnifty import connect_dhan as edge
 from tamingnifty import utils as util
-from tamingnifty.safety import check_trading_day
+from tamingnifty.safety import check_trading_day, validate_calendar
 
 load_dotenv(find_dotenv())
 
+def live_mode():
+    mode = os.environ.get("live_trading", "false").strip().lower()
+    if mode not in ("true", "false"):
+        raise ValueError("live_trading must be true or false")
+    return mode == "true"
+
+
+live_trading = live_mode()
 CONNECTION_STRING = os.environ.get("CONNECTION_STRING")
 user_name = os.environ.get("user_name", "sugam")
 MONGO_DB = os.environ.get("MONGO_DB", "Bots")
@@ -46,8 +54,10 @@ slack_client = WebClient(token=os.environ.get("slack_token"))
 mongo_client = MongoClient(CONNECTION_STRING)
 db = mongo_client[MONGO_DB]
 universe_coll = db["etf_universe"]
-positions = db[f"etf_positions_{user_name}"]   # one doc per position, nothing else
-state = db[f"etf_state_{user_name}"]           # the singletons: accounts / meta / plan
+ledger_user = user_name + "_live" if live_trading else user_name
+positions = db[f"etf_positions_{ledger_user}"]
+state = db[f"etf_state_{ledger_user}"]
+LIVE_START_DATE = "2026-12-01"
 
 # --- strategy parameters (1:1 from the validated engine bt_v2.py, FINALCFG) ---
 LOOKBACK = 21          # momentum window, in trading days
@@ -71,7 +81,7 @@ def notify(message):
 
 
 def today():
-    return datetime.now().date()
+    return util.ist_now().date()
 
 
 def parse_date(s):
@@ -174,6 +184,8 @@ def daily_closes(conn, secid, lookback_days=400):
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df = df.dropna(subset=["datetime"]).sort_values("datetime")
+    if live_trading:
+        df = df[df["datetime"].dt.date < today()]
     dates = [d.date() for d in df["datetime"]]
     closes = [float(c) for c in df["close"]]
     return dates, closes
@@ -213,7 +225,23 @@ def get_meta():
 
 
 def set_meta(**fields):
-    state.update_one({"_id": "meta"}, {"$set": fields}, upsert=True)
+    check_write(state.update_one({"_id": "meta"}, {"$set": fields}, upsert=True))
+
+
+def check_write(result, require_match=False):
+    if not result.acknowledged or (require_match and result.matched_count != 1):
+        raise RuntimeError("Signal persistence not acknowledged/matched")
+
+
+def previous_session():
+    day = today() - timedelta(days=1)
+    while True:
+        document = mongo_client["Bots"]["exchange_calendars"].find_one(
+            {"_id": "NSE:" + str(day.year)})
+        holidays = validate_calendar(document, day)
+        if day.weekday() < 5 and day not in holidays:
+            return day
+        day -= timedelta(days=1)
 
 
 def drop_from_target(sym):
@@ -226,7 +254,7 @@ def drop_from_target(sym):
     if not plan:
         return
     target = [t for t in (plan.get("target") or []) if t["symbol"] != sym]
-    state.update_one({"_id": "plan"}, {"$set": {"target": target}})
+    check_write(state.update_one({"_id": "plan"}, {"$set": {"target": target}}), True)
 
 
 def load_universe():
@@ -246,6 +274,11 @@ def load_universe():
 def main():
     if not check_trading_day(mongo_client, notify):
         return
+    if live_trading and str(today()) < LIVE_START_DATE:
+        notify(f"SIGNAL LIVE waiting until {LIVE_START_DATE}; paper history untouched.")
+        return
+    if live_trading:
+        set_meta(last_signal_date=None)
     candidates, secid_of, tsym_of, bucket_of = load_universe()
 
     conn = edge.login_to_dhan(slack_channel=slack_channel)
@@ -262,6 +295,8 @@ def main():
     series_of = {}
     fetch_into(conn, series_of, [(ref, secid_of[ref])])
     signal_date = newest_candle_date(series_of)
+    if live_trading and signal_date != previous_session():
+        raise ValueError("Live reference candle is not from the previous NSE session")
     if signal_date is None:
         notify(f"SIGNAL ABORT: Dhan returned no daily candles for the calendar "
                f"reference {ref} - cannot tell which session this is, so not "
@@ -275,6 +310,12 @@ def main():
     # 2. Trailing stops - EVERY day. A stop can break on any session.
     active = list(positions.find({"status": "active"}))
     fetch_into(conn, series_of, holdings_to_fetch(active, secid_of))
+    if live_trading:
+        for pos in active:
+            sym = pos["symbol"]
+            dates, closes = series_of.get(sym, ([], []))
+            if not dates or dates[-1] != signal_date:
+                raise ValueError("Live holding candle missing/stale: " + sym)
     stopped_now = []
     for pos in active:
         sym = pos["symbol"]
@@ -302,7 +343,7 @@ def main():
             drop_from_target(sym)                 # no refill: see drop_from_target
             notify(f"SIGNAL: STOP flagged {sym} close={last:.2f} peak={peak:.2f} "
                    f"({(last/peak-1)*100:.1f}% from peak) -> sell at next open")
-        positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields})
+        check_write(positions.update_one({"symbol": sym, "status": "active"}, {"$set": fields}), True)
 
     # 3. Ranking - EVERY session. The rank only drives a decision at a rebalance,
     #    but it is worth seeing daily, so the ~28 Dhan calls are accepted.
@@ -312,6 +353,8 @@ def main():
     closes_by_symbol = {}
     for sym in candidates:
         dates, closes = series_of.get(sym, ([], []))
+        if live_trading and (not dates or dates[-1] != signal_date):
+            raise ValueError("Live candidate candle missing/stale: " + sym)
         if closes:
             closes_by_symbol[sym] = closes
 
@@ -357,9 +400,9 @@ def main():
                  if p["symbol"] not in retained and p["symbol"] not in stopped_now
                  and not p.get("marked_for_exit")]
     for sym in rotations:
-        positions.update_one({"symbol": sym, "status": "active"},
+        check_write(positions.update_one({"symbol": sym, "status": "active"},
                              {"$set": {"marked_for_exit": True,
-                                       "exit_reason": "rebalance"}})
+                                       "exit_reason": "rebalance"}}), True)
 
     # target = the book we want to end up holding, and the ONLY field momentum
     # reads. Each entry carries everything needed to place the order, so that job
@@ -380,7 +423,7 @@ def main():
         "ranking": [{"symbol": s, "rank": i + 1, "momentum": round(mom_of[s], 4)}
                     for i, s in enumerate(ranked)],
     }
-    state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True)
+    check_write(state.update_one({"_id": "plan"}, {"$set": plan}, upsert=True))
 
     # NOT last_rebalanced_month - that one is momentum's to write, because only
     # momentum knows whether the orders went through.

@@ -1,5 +1,6 @@
 """Cost accounting tests; no Mongo, broker or Slack access."""
 import ast
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,6 +52,8 @@ def buy_namespace(open_position=None):
         return SimpleNamespace(acknowledged=True, matched_count=1)
 
     namespace = dict(
+        live_trading=False,
+        math=math,
         positions=SimpleNamespace(find_one=lambda query: open_position,
                                   insert_one=insert, update_one=update),
         orders=SimpleNamespace(insert_one=lambda order: SimpleNamespace(acknowledged=True)),
@@ -101,6 +104,7 @@ def test_sell_records_gross_and_net_and_keeps_gross_roi():
         return SimpleNamespace(acknowledged=True, matched_count=1)
 
     namespace = dict(
+        live_trading=False,
         positions=SimpleNamespace(update_one=update),
         orders=SimpleNamespace(insert_one=lambda order: SimpleNamespace(acknowledged=True)),
         notify=lambda message: None,
