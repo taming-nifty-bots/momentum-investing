@@ -177,7 +177,7 @@ class LivePreparationTests(unittest.TestCase):
         namespace, inserts, _, _ = buy_namespace()
         namespace["live_trading"] = True
         namespace["math"] = math
-        namespace["compute_accounts"] = lambda: dict(unused_balance=50000)
+        namespace["compute_accounts"] = lambda: dict(available_for_trading=50000)
         namespace["place_market"] = Mock(return_value=dict(
             orderStatus="TRADED", averageTradedPrice=101))
         namespace["buy"](None, "PHARMABEES", "1", "PHARMABEES-EQ", "Healthcare", 50000)
@@ -200,7 +200,7 @@ class LivePreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             namespace["buy"](None, "PHARMABEES", "1", "PHARMABEES", "Healthcare", 50000)
         namespace, _, _, _ = buy_namespace()
-        namespace.update(live_trading=True, compute_accounts=lambda: dict(unused_balance=1000))
+        namespace.update(live_trading=True, compute_accounts=lambda: dict(available_for_trading=1000))
         with self.assertRaisesRegex(ValueError, "cash changed"):
             namespace["buy"](None, "PHARMABEES", "1", "PHARMABEES", "Healthcare", 50000)
 
@@ -305,6 +305,14 @@ class LivePreparationTests(unittest.TestCase):
         self.assertEqual(position["status"], "closed")
         self.assertEqual(position["pnl"], round((99.85 - 100.05) * position["quantity"], 2))
         self.assertEqual(position["net_pnl"], round(position["pnl"] - position["charges"]["total"], 2))
+        account = next(doc for doc in documents["etf_state_test_live"] if doc["_id"] == "accounts")
+        self.assertEqual(account["available_for_trading"], 0)
+        summaries = [call.kwargs["text"] for call in slack.call_args_list
+                     if "MOMENTUM summary" in call.kwargs["text"]]
+        self.assertIn("available_for_trading=Rs0.00", summaries[-1])
+        self.assertIn("realized_net_after_estimated_charges", summaries[-1])
+        self.assertTrue(any("incurred charge breakdown" in call.kwargs["text"]
+                            for call in slack.call_args_list))
         self.assertEqual(guards[bot.EXECUTION_SCOPE]["status"], "complete")
         timelines = [call.kwargs["text"] for call in slack.call_args_list
                      if "order timeline" in call.kwargs["text"]]

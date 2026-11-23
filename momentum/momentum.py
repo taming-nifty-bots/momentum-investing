@@ -134,10 +134,13 @@ def compute_accounts():
     total_pnl = round(sum(pnls), 2)
     charges = sum_charges(*all_charges)
     balance = round(start + total_pnl - charges["total"], 2)
+    cash = round(balance - invested, 2)
+    sold_today = any(pos.get("exit_date") == str(today()) for pos in closed)
     return {
         "start_capital": start,
         "total_balance": balance,
-        "unused_balance": round(balance - invested, 2),
+        "unused_balance": cash,
+        "available_for_trading": 0.0 if sold_today else cash,
         "invested": invested,
         "total_trades": len(active) + len(closed),
         "active_trades": len(active),
@@ -336,8 +339,9 @@ def sell(conn, pos, reason):
                   "pnl": pnl, "net_pnl": net_pnl, "charges": charges,
                   "roi": roi, "exit_reason": reason}}), "closed position", require_match=True)
     save_accounts()             # derived from the positions, so recompute AFTER the write
-    notify(f"MOMENTUM: SOLD {sym} x{qty} @ {avg:.2f} ({reason}) gross=Rs{pnl:.2f} "
-           f"charges=Rs{charges['total']:.2f} net=Rs{net_pnl:.2f} gross_roi={roi:.1f}%")
+    notify(f"MOMENTUM: SOLD {sym} x{qty} @ {avg:.2f} ({reason}) "
+           f"net_after_estimated_charges=Rs{net_pnl:.2f} | gross=Rs{pnl:.2f} "
+           f"estimated_charges=Rs{charges['total']:.2f} | gross_roi={roi:.1f}%")
     return round(avg * qty, 2)
 
 
@@ -346,7 +350,7 @@ def buy(conn, sym, secid, tsym, bucket, alloc):
     if live_trading:
         if positions.find_one({"symbol": sym, "status": "active"}):
             raise ValueError("Live holding already exists; refusing duplicate BUY " + sym)
-        if compute_accounts()["unused_balance"] < alloc:
+        if compute_accounts()["available_for_trading"] < alloc:
             raise ValueError("Live cash changed before BUY; recalculate allocation")
     try:
         etf_tax_segment(sym)
@@ -453,13 +457,18 @@ def summary():
     acc = save_accounts()
     holdings = [p["symbol"] for p in active_positions()]
     equity = round(acc["unused_balance"] + acc["invested"], 2)
-    notify("MOMENTUM summary | holdings={h} | cash=Rs{c:.0f} | invested=Rs{i:.0f} | "
-           "realized_balance=Rs{e:.0f} | realized_gross=Rs{p:.0f} | "
-           "realized_net=Rs{n:.0f} | incurred_charges=Rs{f:.0f} | net W/L={w}/{l}".format(
+    notify("MOMENTUM summary | realized_net_after_estimated_charges=Rs{n:.2f} | "
+           "available_for_trading=Rs{a:.2f} | allocated_capital=Rs{s:.2f} | "
+           "strategy_cash_including_unsettled=Rs{c:.2f} | invested_cost=Rs{i:.2f} | "
+           "realized_balance=Rs{e:.2f} | realized_gross=Rs{p:.2f} | "
+           "incurred_estimated_charges=Rs{f:.2f} | net W/L={w}/{l} | holdings={h}".format(
                h=holdings, c=acc["unused_balance"], i=acc["invested"], e=equity,
+               a=acc["available_for_trading"], s=acc["start_capital"],
                p=acc["total_pnl"], n=acc["net_pnl"], f=acc["charges"]["total"],
                w=acc.get("winning_trades", 0),
                l=acc.get("losing_trades", 0)))
+    notify("MOMENTUM incurred charge breakdown (estimated until contract-note reconciliation): "
+           + str(acc["charges"]))
 
 
 def live_ready():
@@ -543,7 +552,7 @@ def main():
         summary()
         return
 
-    available = compute_accounts()["unused_balance"]
+    available = compute_accounts()["available_for_trading"]
     if missing and available > 1e-9:
         notify(f"MOMENTUM: target={[t['symbol'] for t in target]} | held={sorted(held)} | "
                f"buying {names} with settled cash Rs{available:.0f}")

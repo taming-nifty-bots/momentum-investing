@@ -49,9 +49,30 @@ self-contained, scheduled container jobs.
   account prerequisites and contract-note charges remain unverified by offline tests.
   Existing blocked tax classifications and provisional DP charges remain unchanged.
 
+### Allocated cash and charge accounting
+
+The owner clarified: **use the allocated strategy money**, not the overall Dhan
+account balance. `unused_balance` is Rs200,000 plus closed gross P&L, minus all
+incurred entry/exit charges and the actual filled cost of active positions.
+It includes proceeds of any same-day sale; it is not a broker fund-limit claim.
+`available_for_trading` is that charge-adjusted strategy cash, except it is
+**zero on a recorded sale day** under the existing no-same-day-entry/T+1 policy.
+All entry allocation and live buy cash checks use this field.
+
+Charges on active entries and closed round trips are included exactly once.
+Gross `pnl`, itemized `charges` and closed `net_pnl` stay separate; the accounts
+snapshot also shows total incurred charges. Summaries lead with net results and
+available strategy cash, show amounts to paise, and print the full component
+breakdown separately. The owner approved using the canonical conservative
+estimates without waiting for contract notes; Slack labels them as **estimated**,
+not exact broker fees. November24 primary-source checks confirm Dhan's published
+DP tariff is Rs12.50 per instruction/ISIN plus GST, matching the calculator,
+along with the delivery brokerage and turnover-charge rates. No account-wide
+capital is swept into the strategy.
+
 ## November 24 execution and Mongo review
 
-- **29 bot checks** pass, including the actual executor module calling the shared
+- **30 bot checks** pass, including allocated-cash/T+1 charge accounting and the actual executor module calling the shared
   Dhan HTTP preparation/submission/fill code against mocked responses and the
   actual Slack formatting path. The test covers BUY from asks, SELL from bids,
   broker-average fill prices, gross/net close accounting, persisted results before

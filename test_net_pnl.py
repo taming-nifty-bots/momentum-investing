@@ -16,6 +16,7 @@ def load_functions(names, namespace):
     assert len(nodes) == len(names)
     namespace.update(etf_order_charges=etf_order_charges, etf_tax_segment=etf_tax_segment,
                      sum_charges=sum_charges)
+    namespace.setdefault("today", lambda: "2026-10-26")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
 
 
@@ -128,6 +129,24 @@ def test_net_win_count_not_gross_win_count():
     accounts = namespace["compute_accounts"]()
     assert accounts["total_pnl"] == 10 and accounts["net_pnl"] < 0
     assert accounts["winning_trades"] == 0 and accounts["losing_trades"] == 1
+
+
+def test_allocated_cash_debits_open_and_closed_fees_and_blocks_t1_entries():
+    closed = dict(symbol="PHARMABEES", status="closed", quantity=1000,
+                  capital_deployed=100000, exit_price=110, pnl=10000, exit_date="2026-12-02")
+    active = dict(symbol="LIQUIDCASE", status="active", quantity=500, capital_deployed=50000)
+    namespace = dict(START_CAPITAL=200000, today=lambda: "2026-12-02",
+                     positions=SimpleNamespace(find=lambda query:
+                         [active] if query["status"] == "active" else [closed]))
+    load_functions({"compute_accounts"}, namespace)
+    accounts = namespace["compute_accounts"]()
+    assert accounts["charges"]["total"] == 48.47
+    assert accounts["net_pnl"] == 9961.39
+    assert accounts["unused_balance"] == 159951.53
+    assert accounts["available_for_trading"] == 0
+    namespace["today"] = lambda: "2026-12-03"
+    accounts = namespace["compute_accounts"]()
+    assert accounts["available_for_trading"] == 159951.53
 
 
 if __name__ == "__main__":
