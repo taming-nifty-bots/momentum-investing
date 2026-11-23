@@ -1,16 +1,19 @@
 """Offline live handoff boundaries; never connect to broker, Mongo or Slack."""
 import ast
 import inspect
+import importlib.util
 import math
 import os
 import time
 import unittest
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from test_net_pnl import buy_namespace, load_functions
+from test_execution_safety import guard_client
 
 
 def configuration(folder, filename, mode):
@@ -57,11 +60,45 @@ def live_order_namespace(side="BUY", allocation=50000):
         wait_for_fill=Mock(return_value=result),
         round_execution_price=lambda price, tick, side: math.floor(price / tick + 1e-9) * tick)
     namespace = dict(live_trading=True, edge=edge, math=math, time=time,
-        uuid4=lambda: SimpleNamespace(hex="test"), notify=Mock(),
+        uuid4=lambda: SimpleNamespace(hex="a" * 32), notify=Mock(),
         util=SimpleNamespace(ist_now=lambda: datetime(2026, 12, 1, 9, 29), exception_detail=str),
         orders=SimpleNamespace(insert_one=insert, update_one=update))
     load_functions({"place_market", "filled", "check_write"}, namespace)
     return namespace, edge, saved, events
+
+
+def real_executor():
+    documents = {}
+    client, guards = guard_client()
+    for name in ("etf_positions_test_live", "etf_state_test_live", "etf_orders_test_live"):
+        records = []
+        documents[name] = records
+        def collection(records):
+            def find(query):
+                return [deepcopy(doc) for doc in records if all(doc.get(k) == v for k, v in query.items())]
+            def insert(doc):
+                records.append(deepcopy(doc))
+                return SimpleNamespace(acknowledged=True)
+            def update(query, changes, upsert=False):
+                for doc in records:
+                    if all(doc.get(k) == v for k, v in query.items()):
+                        doc.update(deepcopy(changes["$set"]))
+                        return SimpleNamespace(acknowledged=True, matched_count=1)
+                if upsert:
+                    records.append(dict(query, **deepcopy(changes["$set"])))
+                return SimpleNamespace(acknowledged=True, matched_count=0)
+            return SimpleNamespace(find=find, find_one=lambda query: next(iter(find(query)), None),
+                                   insert_one=insert, update_one=update)
+        client["Bots"][name] = collection(records)
+    path = Path(__file__).parent / "momentum" / "momentum.py"
+    spec = importlib.util.spec_from_file_location("momentum_review_test", path)
+    bot = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, {"live_trading": "true", "user_name": "test", "MONGO_DB": "Bots"}), \
+            patch("dotenv.load_dotenv"), patch("dotenv.find_dotenv", return_value=""), \
+            patch("pymongo.MongoClient", return_value=client), patch("slack_sdk.WebClient"):
+        spec.loader.exec_module(bot)
+    bot.today = lambda: datetime(2026, 12, 1).date()
+    return bot, documents, guards
 
 
 class LivePreparationTests(unittest.TestCase):
@@ -108,6 +145,7 @@ class LivePreparationTests(unittest.TestCase):
         self.assertEqual(saved[0]["orderStatus"], "TRADED")
         self.assertIs(edge.wait_for_fill.call_args.kwargs["prepared"], prepared)
         self.assertEqual(namespace["notify"].call_count, 1)
+        self.assertLessEqual(len(edge.prepare_order.call_args.kwargs["correlation_id"]), 30)
 
     def test_over_budget_depth_and_intent_write_failure_submit_nothing(self):
         namespace, edge, _, _ = live_order_namespace()
@@ -201,6 +239,84 @@ class LivePreparationTests(unittest.TestCase):
         namespace["main"]()
         namespace["get_plan"].assert_not_called()
         namespace["summary"].assert_called_once()
+
+    def test_real_job_http_boundaries_persist_actual_fill_and_batch_slack(self):
+        bot, documents, guards = real_executor()
+        requests = []
+        quote = dict(depth=dict(buy=[dict(price=99.9, quantity=10000)],
+                                sell=[dict(price=100, quantity=10000)]),
+                     lower_circuit_limit=50, upper_circuit_limit=150)
+        def post(url, headers, json, timeout):
+            if url.endswith("/marketfeed/quote"):
+                data = dict(status="success", data={"NSE_EQ": {"1": quote}})
+            else:
+                self.assertEqual(json["exchangeSegment"], "NSE_EQ")
+                self.assertEqual(json["productType"], "CNC")
+                self.assertEqual(json["orderType"], "LIMIT")
+                self.assertLessEqual(len(json["correlationId"]), 30)
+                self.assertTrue(documents["etf_orders_test_live"])
+                requests.append(deepcopy(json))
+                data = dict(orderId="123", orderStatus="PENDING")
+            return SimpleNamespace(status_code=200, json=lambda: data)
+        def get(url, headers, timeout):
+            request = requests[-1]
+            data = dict(request, orderId="123", orderStatus="TRADED",
+                        filledQty=request["quantity"],
+                        averageTradedPrice=100.05 if request["transactionType"] == "BUY" else 99.85)
+            return SimpleNamespace(status_code=200, json=lambda: data)
+        documents["etf_state_test_live"].extend([
+            dict(_id="meta", last_signal_date="2026-12-01", last_candle_date="2026-11-30"),
+            dict(_id="plan", for_month="2026-12", target=[
+                dict(symbol="PHARMABEES", secid="1", tsym="PHARMABEES-EQ", bucket="Healthcare")])])
+        slack = bot.slack_client.chat_postMessage
+        def posted(**kwargs):
+            self.assertEqual(kwargs["channel"], "#etf-momentum-investing")
+            if "order timeline" in kwargs["text"]:
+                self.assertEqual(documents["etf_orders_test_live"][-1]["orderStatus"], "TRADED")
+            self.assertNotEqual(kwargs["text"], "")
+        slack.side_effect = posted
+        with patch.object(bot, "check_trading_day", return_value=True), \
+                patch.object(bot.edge, "login_to_dhan", return_value=dict(client_id="test", access_token="test")), \
+                patch.object(bot.edge, "get_equity_ltp", return_value=100), \
+                patch.object(bot.edge, "execution_tick", return_value=0.01), \
+                patch.object(bot.edge.requests, "post", side_effect=post), \
+                patch.object(bot.edge.requests, "get", side_effect=get), \
+                patch.object(bot.util, "ist_now", return_value=datetime(2026, 12, 1, 9, 29)) as clock, \
+                patch.object(bot.util, "get_public_ip", return_value="test"), \
+                patch.object(bot.time, "sleep"):
+            bot.main()
+            count = len(requests)
+            bot.main()
+            self.assertEqual(len(requests), 1, "Restart must not duplicate the BUY")
+            documents["etf_positions_test_live"][0]["marked_for_exit"] = True
+            documents["etf_state_test_live"][0]["last_signal_date"] = "2026-12-02"
+            documents["etf_state_test_live"][0]["last_candle_date"] = "2026-12-01"
+            bot.today = lambda: datetime(2026, 12, 2).date()
+            clock.return_value = datetime(2026, 12, 2, 9, 29)
+            bot.main()
+            bot.main()
+        self.assertEqual(count, 1)
+        self.assertEqual(len(requests), 2, "Same-day sale rerun must not submit another order")
+        self.assertGreater(requests[0]["price"], 100, "BUY must price from the ask, with cushion")
+        self.assertLess(requests[1]["price"], 99.9, "SELL must price from the bid, with cushion")
+        position = documents["etf_positions_test_live"][0]
+        self.assertEqual(position["entry_price"], 100.05, "Use broker fill, not quote LIMIT or LTP")
+        self.assertEqual(position["exit_price"], 99.85)
+        self.assertEqual(position["status"], "closed")
+        self.assertEqual(position["pnl"], round((99.85 - 100.05) * position["quantity"], 2))
+        self.assertEqual(position["net_pnl"], round(position["pnl"] - position["charges"]["total"], 2))
+        self.assertEqual(guards[bot.EXECUTION_SCOPE]["status"], "complete")
+        timelines = [call.kwargs["text"] for call in slack.call_args_list
+                     if "order timeline" in call.kwargs["text"]]
+        self.assertEqual(len(timelines), 2)
+        self.assertIn("Broker status TRADED", timelines[0])
+
+    def test_executor_rebalance_stamp_requires_acknowledged_write(self):
+        namespace = dict(state=SimpleNamespace(update_one=lambda *args, **kwargs:
+                                               SimpleNamespace(acknowledged=False)))
+        load_functions({"set_meta", "check_write"}, namespace)
+        with self.assertRaisesRegex(RuntimeError, "executor metadata"):
+            namespace["set_meta"](last_rebalanced_month="2026-12")
 
 
 if __name__ == "__main__":

@@ -169,7 +169,8 @@ def get_meta():
 
 
 def set_meta(**fields):
-    state.update_one({"_id": "meta"}, {"$set": fields}, upsert=True)
+    check_write(state.update_one({"_id": "meta"}, {"$set": fields}, upsert=True),
+                "executor metadata")
 
 
 def get_plan():
@@ -237,7 +238,7 @@ def place_market(conn, secid, tsym, side, qty, alloc=None):
         print(text, flush=True)
         timeline.append(text)
 
-    order_key = "LIVE-" + uuid4().hex
+    order_key = "LIVE-" + uuid4().hex[:25]
     try:
         event(f"{side} {tsym} x{qty} | preparing fresh depth")
         prepared = edge.prepare_order(

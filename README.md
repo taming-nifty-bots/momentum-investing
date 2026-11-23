@@ -49,6 +49,39 @@ self-contained, scheduled container jobs.
   account prerequisites and contract-note charges remain unverified by offline tests.
   Existing blocked tax classifications and provisional DP charges remain unchanged.
 
+## November 24 execution and Mongo review
+
+- **29 bot checks** pass, including the actual executor module calling the shared
+  Dhan HTTP preparation/submission/fill code against mocked responses and the
+  actual Slack formatting path. The test covers BUY from asks, SELL from bids,
+  broker-average fill prices, gross/net close accounting, persisted results before
+  timelines, and no duplicate orders on restart.
+- **37 shared execution checks** pass against published 2.4.7: cumulative depth,
+  directional tick rounding, spread/depth/circuit checks, partial fills, repricing,
+  deadline cancellations and fill races, HTTP429 retries and immediate/batched
+  notification behavior. These are offline checks, not real broker fills.
+- All **28 universe rows** match the current public Dhan NSE cash master for
+  security ID, symbol, one-share lot size and a positive tick. One approved,
+  clearly labelled Slack smoke-test was accepted in the momentum channel.
+- Review fixed a generated correlation ID longer than Dhan's
+  [30-character limit](https://dhanhq.co/docs/v2/orders/) and an unchecked
+  executor metadata write. IDs now fit the vendor limit and rebalance stamps
+  require acknowledged persistence.
+- Keep position history and order/intent history. `plan` is the executable target;
+  `meta` controls completion and signal freshness. `accounts` is a derived reading
+  cache, not an independent money ledger; it is optional conceptually but the
+  current job recreates it. `plan.ranking` and duplicate EOD display fields are
+  visibility conveniences, not execution requirements. None was deleted.
+  `etf_params` is absent and no longer read; do not recreate it. The parked
+  LIQUIDCASE universe row is excluded from selection and harmless to retain.
+- Remaining operational limitations: real broker acceptance/fills, CNC sale
+  authorization, account funds/holdings and static-IP whitelisting still need
+  confirmation before activation. A failed signal/guard blocks automated exits
+  as well as entries. The pre-existing 400-calendar-day peak reconstruction can
+  forget an older peak on very long-held positions; the current active records
+  were entered November 3, so this is a future risk, not evidence of a current
+  incorrect stop. No stop-rule change was made in this preparation.
+
 ## The strategy (exact rules)
 
 Every number below is a 1:1 transcription of the validated engine (`bt_v2.py`,
